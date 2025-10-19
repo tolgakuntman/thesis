@@ -1,0 +1,25 @@
+name: thesis
+channels:
+  - conda-forge
+dependencies:
+  - ipykernel
+  - jupyterlab
+  - matplotlib
+  - numpy
+  - pandas
+  - polars
+  - pyarrow
+  - python=3.11
+  - rich
+  - scikit-learn
+  - tqdm
+  - scipy
+  - xgboost
+  - shap
+  - pydriller
+  - tqdm
+  - pip
+  - pip:
+      - torch
+      - torchvision
+prefix: "/Users/tolgakuntman/miniconda3/envs/thesis"
