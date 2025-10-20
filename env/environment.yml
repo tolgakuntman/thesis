@@ -17,6 +17,7 @@ dependencies:
   - xgboost
   - shap
   - tqdm
+  - seaborn
   - pip
   - pip:
       - torch
