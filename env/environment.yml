@@ -1,24 +1,26 @@
 name: thesis
 channels:
+  - pytorch
   - conda-forge
 dependencies:
+  - python=3.11
+  - pip
   - ipykernel
   - jupyterlab
   - matplotlib
-  - numpy
+  - "numpy<2.0"
   - pandas
   - polars
   - pyarrow
-  - python=3.11
   - rich
   - scikit-learn
-  - tqdm
-  - scipy
+  - "scipy<2.0"
   - xgboost
   - shap
-  - tqdm
   - seaborn
-  - pip
+  - tqdm
+  - pytorch
+  - torchvision
+  - torchaudio
   - pip:
-      - torch
-      - torchvision
+      - torch-geometric
