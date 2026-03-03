@@ -1,6 +1,5 @@
 name: thesis
 channels:
-  - pytorch
   - conda-forge
 dependencies:
   - python=3.11
@@ -19,8 +18,8 @@ dependencies:
   - shap
   - seaborn
   - tqdm
-  - pytorch
-  - torchvision
-  - torchaudio
   - pip:
+      - torch
+      - torchvision
+      - torchaudio
       - torch-geometric
