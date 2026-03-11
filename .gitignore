@@ -24,3 +24,5 @@ data_new
 data/
 data_new/
 notebooks/movie_lens.ipynb
+.claude
+*.png
