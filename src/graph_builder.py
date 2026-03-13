@@ -12,6 +12,16 @@ from torch_geometric.data import HeteroData
 
 OWNERSHIP_THRESHOLD = 0.05   # Bird et al. (2011) minor-contributor cutoff
 
+# Known automation / bot identities — used to flag authored_by / committed_by edges
+BOT_EMAILS: frozenset[str] = frozenset({
+    "gardener@tensorflow.org",
+})
+
+
+def _is_bot(email: str) -> float:
+    """Return 1.0 if the email belongs to a known automation bot, else 0.0."""
+    return 1.0 if email.strip().lower() in BOT_EMAILS else 0.0
+
 # Columns to exclude when auto-detecting raw numeric features
 EXCLUDE_PATTERNS = [
     "hash", "repo", "url", "id", "number", "node_id", "fc_hash", "vcc_hash",
@@ -271,13 +281,14 @@ def add_developer_nodes(
     Inclusion rule: ownership_ratio >= threshold OR commit author (Bird et al. 2011).
     Stores email_to_dev_idx on data for use by add_developer_edges().
     """
-    authored_emails, author_roles, own_rows = _get_developer_data(
+    author_emails, committer_emails, own_rows = _get_developer_data(
         commit_hash, ownership_window, commit_author,
         ownership_window_days, ownership_threshold,
     )
+    all_commit_emails = list(dict.fromkeys(author_emails + committer_emails))
 
     all_dev_emails   = list(dict.fromkeys(
-        authored_emails + (own_rows["_email"].tolist() if not own_rows.empty else [])
+        all_commit_emails + (own_rows["_email"].tolist() if not own_rows.empty else [])
     ))
     email_to_dev_idx = {e: i for i, e in enumerate(all_dev_emails)}
 
@@ -295,10 +306,10 @@ def add_developer_nodes(
 
     data["developer"].x = torch.tensor(dev_feats, dtype=torch.float32)
     # Stash for edge builder (avoids recomputing)
-    data["developer"]._email_to_idx  = email_to_dev_idx
-    data["developer"]._authored_emails = authored_emails
-    data["developer"]._author_roles    = author_roles
-    data["developer"]._own_rows        = own_rows
+    data["developer"]._email_to_idx     = email_to_dev_idx
+    data["developer"]._author_emails    = author_emails
+    data["developer"]._committer_emails = committer_emails
+    data["developer"]._own_rows         = own_rows
 
 
 def add_issue_nodes(
@@ -498,39 +509,48 @@ def add_developer_edges(
     ownership_threshold: float = OWNERSHIP_THRESHOLD,
 ) -> None:
     """
-    (commit, authored_by, developer) — 1 feature: role (1=author, 0=committer)
-    (developer, owns, file)          — 3 features: ownership_ratio, norm_lines, log_edits
+    (commit, authored_by,  developer) — 1 feature: is_bot (1=known automation bot)
+    (commit, committed_by, developer) — 1 feature: is_bot
+    (developer, owns, file)           — 3 features: ownership_ratio, norm_lines, log_edits
     Reads stashed data from add_developer_nodes() if available.
     """
     # Retrieve stashed data (set by add_developer_nodes)
     if hasattr(data.get("developer", HeteroData()), "_email_to_idx"):
-        email_to_dev_idx = data["developer"]._email_to_idx
-        authored_emails  = data["developer"]._authored_emails
-        author_roles     = data["developer"]._author_roles
-        own_rows         = data["developer"]._own_rows
+        email_to_dev_idx  = data["developer"]._email_to_idx
+        author_emails     = data["developer"]._author_emails
+        committer_emails  = data["developer"]._committer_emails
+        own_rows          = data["developer"]._own_rows
     else:
-        authored_emails, author_roles, own_rows = _get_developer_data(
+        author_emails, committer_emails, own_rows = _get_developer_data(
             commit_hash, ownership_window, commit_author,
             ownership_window_days, ownership_threshold,
         )
-        all_dev_emails   = list(dict.fromkeys(
-            authored_emails + (own_rows["_email"].tolist() if not own_rows.empty else [])
+        all_commit_emails = list(dict.fromkeys(author_emails + committer_emails))
+        all_dev_emails    = list(dict.fromkeys(
+            all_commit_emails + (own_rows["_email"].tolist() if not own_rows.empty else [])
         ))
-        email_to_dev_idx = {e: i for i, e in enumerate(all_dev_emails)}
+        email_to_dev_idx  = {e: i for i, e in enumerate(all_dev_emails)}
 
-    c2d_src, c2d_dst, c2d_role = [], [], []
-    for email, role in zip(authored_emails, author_roles):
-        if email in email_to_dev_idx:
-            c2d_src.append(0)
-            c2d_dst.append(email_to_dev_idx[email])
-            c2d_role.append(float(role))
+    def _build_c2d(emails: list[str]):
+        src, dst, attr = [], [], []
+        for email in emails:
+            if email in email_to_dev_idx:
+                src.append(0)
+                dst.append(email_to_dev_idx[email])
+                attr.append([_is_bot(email)])
+        return src, dst, attr
 
-    if c2d_src:
-        data["commit", "authored_by", "developer"].edge_index = torch.tensor([c2d_src, c2d_dst], dtype=torch.long)
-        data["commit", "authored_by", "developer"].edge_attr  = torch.tensor([[r] for r in c2d_role], dtype=torch.float32)
-    else:
-        data["commit", "authored_by", "developer"].edge_index = torch.zeros((2, 0), dtype=torch.long)
-        data["commit", "authored_by", "developer"].edge_attr  = torch.zeros((0, 1), dtype=torch.float32)
+    for et, emails in [
+        ("authored_by",  author_emails),
+        ("committed_by", committer_emails),
+    ]:
+        src, dst, attr = _build_c2d(emails)
+        if src:
+            data["commit", et, "developer"].edge_index = torch.tensor([src, dst], dtype=torch.long)
+            data["commit", et, "developer"].edge_attr  = torch.tensor(attr, dtype=torch.float32)
+        else:
+            data["commit", et, "developer"].edge_index = torch.zeros((2, 0), dtype=torch.long)
+            data["commit", et, "developer"].edge_attr  = torch.zeros((0, 1), dtype=torch.float32)
 
     new_path_to_fi = {
         str(frow["new_path"]): fi
@@ -1027,16 +1047,27 @@ def _get_developer_data(
     commit_author: Optional[pd.DataFrame],
     ownership_window_days: int,
     ownership_threshold: float,
-) -> tuple[list[str], list[int], pd.DataFrame]:
-    """Shared logic for collecting and filtering developer data."""
-    authored_emails: list[str] = []
-    author_roles:    list[int] = []
+) -> tuple[list[str], list[str], pd.DataFrame]:
+    """Shared logic for collecting and filtering developer data.
+
+    Returns
+    -------
+    author_emails    : emails that appear as ``role == "author"`` for this commit
+    committer_emails : emails that appear as ``role == "committer"`` for this commit
+    own_rows         : filtered ownership_window rows (Bird et al. threshold)
+    """
+    author_emails:    list[str] = []
+    committer_emails: list[str] = []
 
     if commit_author is not None:
         ca = commit_author[commit_author["commit_hash"] == commit_hash]
         for _, row in ca.iterrows():
-            authored_emails.append(str(row["dev_id"]).strip().lower())
-            author_roles.append(1 if str(row.get("role", "")).lower() == "author" else 0)
+            email = str(row["dev_id"]).strip().lower()
+            role  = str(row.get("role", "")).lower()
+            if role == "author":
+                author_emails.append(email)
+            else:
+                committer_emails.append(email)
 
     own_rows = pd.DataFrame()
     if ownership_window is not None:
@@ -1048,13 +1079,13 @@ def _get_developer_data(
             ow     = ow[ow["window_days"] == chosen].copy()
             ecol   = "dev_email" if "dev_email" in ow.columns else "dev_id"
             ow["_email"] = ow[ecol].str.strip().str.lower()
-            author_set = set(authored_emails)
+            all_author_set = set(author_emails) | set(committer_emails)
             own_rows   = ow[
                 (ow["ownership_ratio"] >= ownership_threshold) |  # 5% threshold (Bird et al.)
-                ow["_email"].isin(author_set)
+                ow["_email"].isin(all_author_set)
             ].copy()
 
-    return authored_emails, author_roles, own_rows
+    return author_emails, committer_emails, own_rows
 
 
 # ═════════════════════════════════════════════════════════════════════════════
@@ -1254,7 +1285,11 @@ def build_multi_commit_graph(
             data[et].edge_index = torch.zeros((2, 0), dtype=torch.long)
 
     # ── Step 6: merge developer edges with global index remapping ─────────────
-    c2d_src, c2d_dst, c2d_attr = [], [], []
+    # Accumulate authored_by and committed_by separately; owns is shared.
+    c2d_buckets: dict[str, tuple[list, list, list]] = {
+        "authored_by":  ([], [], []),
+        "committed_by": ([], [], []),
+    }
     d2f_src, d2f_dst, d2f_attr = [], [], []
 
     for i, g in enumerate(subgraphs):
@@ -1267,19 +1302,22 @@ def build_multi_commit_graph(
             email = local_idx_to_email.get(local_idx)
             return global_email_to_idx.get(email, -1) if email else -1
 
-        c2d_et = ("commit", "authored_by", "developer")
-        if c2d_et in g.edge_types:
+        for rel in ("authored_by", "committed_by"):
+            c2d_et = ("commit", rel, "developer")
+            if c2d_et not in g.edge_types:
+                continue
             ei = g[c2d_et].edge_index
             ea = g[c2d_et].get("edge_attr")
+            src_list, dst_list, attr_list = c2d_buckets[rel]
             for k in range(ei.shape[1]):
                 gci = offsets["commit"][i] + ei[0, k].item()
                 gdi = _remap(ei[1, k].item())
                 if gdi < 0:
                     continue
-                c2d_src.append(gci)
-                c2d_dst.append(gdi)
+                src_list.append(gci)
+                dst_list.append(gdi)
                 if ea is not None:
-                    c2d_attr.append(ea[k])
+                    attr_list.append(ea[k])
 
         d2f_et = ("developer", "owns", "file")
         if d2f_et in g.edge_types:
@@ -1295,13 +1333,15 @@ def build_multi_commit_graph(
                 if ea is not None:
                     d2f_attr.append(ea[k])
 
-    if c2d_src:
-        data["commit", "authored_by", "developer"].edge_index = torch.tensor(
-            [c2d_src, c2d_dst], dtype=torch.long)
-        if c2d_attr:
-            data["commit", "authored_by", "developer"].edge_attr = torch.stack(c2d_attr)
-    else:
-        data["commit", "authored_by", "developer"].edge_index = torch.zeros((2, 0), dtype=torch.long)
+    for rel, (src_list, dst_list, attr_list) in c2d_buckets.items():
+        if src_list:
+            data["commit", rel, "developer"].edge_index = torch.tensor(
+                [src_list, dst_list], dtype=torch.long)
+            if attr_list:
+                data["commit", rel, "developer"].edge_attr = torch.stack(attr_list)
+        else:
+            data["commit", rel, "developer"].edge_index = torch.zeros((2, 0), dtype=torch.long)
+            data["commit", rel, "developer"].edge_attr  = torch.zeros((0, 1), dtype=torch.float32)
 
     if d2f_src:
         data["developer", "owns", "file"].edge_index = torch.tensor(
