@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import re
+from collections import defaultdict
 from itertools import combinations
 from typing import Optional
 
@@ -407,7 +408,7 @@ def add_commit_file_edges(
             frow["num_lines_added"]   / total_add,
             frow["num_lines_deleted"] / total_del,
             frow.get("num_method_changed", 0) / total_meth,
-            float(old_p != new_p and old_p and new_p),
+            float(bool(old_p) and bool(new_p) and old_p != new_p),
         ])
 
     data["commit", "has", "file"].edge_index = torch.stack([src, dst])
@@ -798,6 +799,7 @@ def load_all_tables(base_path: str = "..") -> dict[str, pd.DataFrame]:
     _load(os.path.join(g, "issue_info_v3.csv"),                       "issue_info")
     _load(os.path.join(g, "pull_request_info_v3.csv"),                "pr_info")
     _load(os.path.join(g, "release_tag_info_v3.csv"),                 "release_tag_info")
+    _load(os.path.join(p, "data/processed/cve_fc_vcc_mapping.csv"),   "vcc_fc_mapping")
 
     return tables
 
@@ -1053,6 +1055,532 @@ def _get_developer_data(
             ].copy()
 
     return authored_emails, author_roles, own_rows
+
+
+# ═════════════════════════════════════════════════════════════════════════════
+# Multi-commit graph construction
+# ═════════════════════════════════════════════════════════════════════════════
+
+def build_multi_commit_graph(
+    commit_hashes: list[str],
+    tables: dict[str, pd.DataFrame],
+    mode: int = 4,
+    include_files: bool = True,
+    include_functions: bool = True,
+    include_developers: bool = True,
+    include_issues: bool = True,
+    include_prs: bool = True,
+    include_tags: bool = True,
+    ownership_window_days: int = 90,
+    ownership_threshold: float = OWNERSHIP_THRESHOLD,
+    max_issues: Optional[int] = None,
+    max_prs: Optional[int] = None,
+    max_tags: Optional[int] = None,
+    include_parent_edges: bool = True,
+    include_vcc_fc_edges: bool = True,
+) -> HeteroData:
+    """
+    Build a multi-commit heterogeneous graph from a list of commit hashes.
+
+    Node deduplication strategy (hybrid):
+      - commit        : one node per commit hash (always unique)
+      - file          : snapshot per commit (one node per commit-file pair)
+      - function      : snapshot per commit (one node per commit-function pair)
+      - developer     : unified across all commits (one node per unique email)
+      - issue/PR/tag  : snapshot per commit (same as single-commit graph)
+
+    Cross-commit edges added:
+      (file, same_entity, file)
+          same filename modified in different commits
+          attr: [delta_complexity, delta_loc, delta_token_count, log1p(time_gap_days)]
+      (function, same_entity, function)
+          same (filename, name) in different commits
+          attr: [delta_complexity, delta_loc, log1p(time_gap_days)]
+      (commit, parent_of, commit)
+          git DAG parent→child — both commits must be in commit_hashes
+          attr: [log1p(time_delta_days), is_merge]
+      (commit, fixes, commit)
+          VCC→FC pairs from cve_fc_vcc_mapping — both must be in commit_hashes
+          attr: [log1p(days_vcc_to_fc)]
+
+    All intra-commit edge types from build_graph() are preserved with adjusted
+    global node indices. Developer edges are remapped to unified developer indices.
+
+    Parameters
+    ----------
+    commit_hashes        : ordered list of commit SHAs to include
+    tables               : dict returned by load_all_tables()
+    mode                 : graph mode passed to build_graph() for each commit
+    include_parent_edges : add (commit, parent_of, commit) edges
+    include_vcc_fc_edges : add (commit, fixes, commit) edges
+
+    Returns
+    -------
+    HeteroData with global node indices and all intra/cross-commit edges.
+    Metadata stored as:
+      data._commit_hashes   — list of commit hashes in node order
+      data._commit_idx_map  — dict mapping hash → commit node index
+    """
+    if not commit_hashes:
+        raise ValueError("commit_hashes must be non-empty.")
+
+    # ── Step 1: per-commit subgraphs ──────────────────────────────────────────
+    subgraphs: list[HeteroData] = []
+    for h in commit_hashes:
+        try:
+            g = build_graph(
+                h, tables, mode=mode,
+                include_files=include_files,
+                include_functions=include_functions,
+                include_developers=include_developers,
+                include_issues=include_issues,
+                include_prs=include_prs,
+                include_tags=include_tags,
+                ownership_window_days=ownership_window_days,
+                ownership_threshold=ownership_threshold,
+                max_issues=max_issues,
+                max_prs=max_prs,
+                max_tags=max_tags,
+            )
+        except ValueError:
+            g = HeteroData()
+        subgraphs.append(g)
+
+    # ── Step 2: cumulative offsets for snapshot node types ────────────────────
+    SNAPSHOT_TYPES = ["commit", "file", "function", "issue", "pull_request", "release_tag"]
+    offsets: dict[str, list[int]] = {nt: [0] for nt in SNAPSHOT_TYPES}
+    for g in subgraphs:
+        for nt in SNAPSHOT_TYPES:
+            prev = offsets[nt][-1]
+            n = g[nt].x.shape[0] if nt in g.node_types else 0
+            offsets[nt].append(prev + n)
+
+    # ── Step 3: unified developer nodes ───────────────────────────────────────
+    all_emails: list[str] = []
+    seen_emails: set[str] = set()
+    for g in subgraphs:
+        dev = g["developer"] if "developer" in g.node_types else None
+        if dev is not None and hasattr(dev, "_email_to_idx"):
+            for email in dev._email_to_idx:
+                if email not in seen_emails:
+                    all_emails.append(email)
+                    seen_emails.add(email)
+    global_email_to_idx: dict[str, int] = {e: i for i, e in enumerate(all_emails)}
+
+    n_devs = len(all_emails)
+    dev_feats = np.zeros((max(n_devs, 0), len(DEV_FEAT_COLS)), dtype=np.float32)
+    developer_info = tables.get("developer_info")
+    if developer_info is not None and n_devs > 0:
+        di = developer_info.copy()
+        di["_email"] = di["dev_id"].str.strip().str.lower()
+        di = di.set_index("_email")
+        for email, idx in global_email_to_idx.items():
+            if email in di.index:
+                vals = di.loc[email, DEV_FEAT_COLS].fillna(0).values.astype("float64")
+                dev_feats[idx] = np.log1p(vals)
+
+    # ── Step 4: merge HeteroData — snapshot node features ────────────────────
+    data = HeteroData()
+
+    for nt in SNAPSHOT_TYPES:
+        tensors = [g[nt].x for g in subgraphs if nt in g.node_types]
+        if tensors:
+            # Pad to max feature dim in case some commits lack optional features (e.g. tag context)
+            max_dim = max(t.shape[1] for t in tensors)
+            padded = []
+            for t in tensors:
+                if t.shape[1] < max_dim:
+                    pad = torch.zeros(t.shape[0], max_dim - t.shape[1], dtype=torch.float32)
+                    t = torch.cat([t, pad], dim=1)
+                padded.append(t)
+            data[nt].x = torch.cat(padded, dim=0)
+        else:
+            fdim = next((g[nt].x.shape[1] for g in subgraphs if nt in g.node_types), 1)
+            data[nt].x = torch.zeros((0, fdim), dtype=torch.float32)
+
+    data["developer"].x = torch.tensor(dev_feats, dtype=torch.float32)
+    data["developer"]._email_to_idx = global_email_to_idx
+
+    # ── Step 5: merge intra-commit snapshot edges (non-developer) ─────────────
+    SNAPSHOT_EDGE_TYPES = [
+        ("commit", "has", "file"),
+        ("file", "has", "function"),
+        ("function", "co_modified", "function"),
+        ("commit", "linked_issue", "issue"),
+        ("issue", "issue_of", "commit"),
+        ("commit", "linked_pr", "pull_request"),
+        ("pull_request", "pr_of", "commit"),
+        ("commit", "has_release_tag", "release_tag"),
+        ("release_tag", "tag_of", "commit"),
+        ("pull_request", "references_issue", "issue"),
+        ("issue", "referenced_by_pr", "pull_request"),
+        ("release_tag", "next_tag", "release_tag"),
+        ("release_tag", "prev_tag", "release_tag"),
+        ("issue", "next_issue", "issue"),
+        ("issue", "prev_issue", "issue"),
+        ("pull_request", "next_pr", "pull_request"),
+        ("pull_request", "prev_pr", "pull_request"),
+        ("commit", "tag_context_pr", "pull_request"),
+        ("pull_request", "tag_context_of", "commit"),
+        ("commit", "tag_context_issue", "issue"),
+        ("issue", "tag_context_of", "commit"),
+        ("release_tag", "affects_pr", "pull_request"),
+        ("pull_request", "in_release", "release_tag"),
+        ("release_tag", "affects_issue", "issue"),
+        ("issue", "in_release", "release_tag"),
+    ]
+
+    for et in SNAPSHOT_EDGE_TYPES:
+        src_t, rel, dst_t = et
+        all_ei, all_ea = [], []
+        for i, g in enumerate(subgraphs):
+            if et not in g.edge_types:
+                continue
+            ei = g[et].edge_index
+            if ei.shape[1] == 0:
+                continue
+            src_off = offsets[src_t][i]
+            dst_off = offsets[dst_t][i]
+            all_ei.append(ei + torch.tensor([[src_off], [dst_off]], dtype=torch.long))
+            ea = g[et].get("edge_attr")
+            if ea is not None:
+                all_ea.append(ea)
+
+        if all_ei:
+            data[et].edge_index = torch.cat(all_ei, dim=1)
+            if len(all_ea) == len(all_ei):   # all non-empty subgraphs have attr
+                data[et].edge_attr = torch.cat(all_ea, dim=0)
+        else:
+            data[et].edge_index = torch.zeros((2, 0), dtype=torch.long)
+
+    # ── Step 6: merge developer edges with global index remapping ─────────────
+    c2d_src, c2d_dst, c2d_attr = [], [], []
+    d2f_src, d2f_dst, d2f_attr = [], [], []
+
+    for i, g in enumerate(subgraphs):
+        dev = g["developer"] if "developer" in g.node_types else None
+        if dev is None or not hasattr(dev, "_email_to_idx"):
+            continue
+        local_idx_to_email = {v: k for k, v in dev._email_to_idx.items()}
+
+        def _remap(local_idx: int) -> int:
+            email = local_idx_to_email.get(local_idx)
+            return global_email_to_idx.get(email, -1) if email else -1
+
+        c2d_et = ("commit", "authored_by", "developer")
+        if c2d_et in g.edge_types:
+            ei = g[c2d_et].edge_index
+            ea = g[c2d_et].get("edge_attr")
+            for k in range(ei.shape[1]):
+                gci = offsets["commit"][i] + ei[0, k].item()
+                gdi = _remap(ei[1, k].item())
+                if gdi < 0:
+                    continue
+                c2d_src.append(gci)
+                c2d_dst.append(gdi)
+                if ea is not None:
+                    c2d_attr.append(ea[k])
+
+        d2f_et = ("developer", "owns", "file")
+        if d2f_et in g.edge_types:
+            ei = g[d2f_et].edge_index
+            ea = g[d2f_et].get("edge_attr")
+            for k in range(ei.shape[1]):
+                gdi = _remap(ei[0, k].item())
+                gfi = offsets["file"][i] + ei[1, k].item()
+                if gdi < 0:
+                    continue
+                d2f_src.append(gdi)
+                d2f_dst.append(gfi)
+                if ea is not None:
+                    d2f_attr.append(ea[k])
+
+    if c2d_src:
+        data["commit", "authored_by", "developer"].edge_index = torch.tensor(
+            [c2d_src, c2d_dst], dtype=torch.long)
+        if c2d_attr:
+            data["commit", "authored_by", "developer"].edge_attr = torch.stack(c2d_attr)
+    else:
+        data["commit", "authored_by", "developer"].edge_index = torch.zeros((2, 0), dtype=torch.long)
+
+    if d2f_src:
+        data["developer", "owns", "file"].edge_index = torch.tensor(
+            [d2f_src, d2f_dst], dtype=torch.long)
+        if d2f_attr:
+            data["developer", "owns", "file"].edge_attr = torch.stack(d2f_attr)
+    else:
+        data["developer", "owns", "file"].edge_index = torch.zeros((2, 0), dtype=torch.long)
+
+    # ── Step 7: cross-commit edges ────────────────────────────────────────────
+    commit_info = tables.get("commit_info", pd.DataFrame())
+    commit_dates: dict[str, pd.Timestamp] = {}
+    if not commit_info.empty:
+        for h in commit_hashes:
+            row = commit_info[commit_info["hash"] == h]
+            if not row.empty:
+                commit_dates[h] = pd.to_datetime(row["author_date"].values[0], utc=True)
+
+    commit_idx_map = {h: i for i, h in enumerate(commit_hashes)}
+
+    _add_same_entity_file_edges(data, commit_hashes, tables, offsets, commit_dates)
+    _add_same_entity_function_edges(data, commit_hashes, tables, offsets, commit_dates)
+
+    if include_parent_edges:
+        _add_parent_of_edges(data, commit_hashes, tables, commit_idx_map, commit_dates)
+
+    if include_vcc_fc_edges:
+        _add_vcc_fc_edges(data, commit_hashes, tables, commit_idx_map, commit_dates)
+
+    # ── Metadata ──────────────────────────────────────────────────────────────
+    data._commit_hashes  = commit_hashes
+    data._commit_idx_map = commit_idx_map
+
+    return data
+
+
+def _add_same_entity_file_edges(
+    data: HeteroData,
+    commit_hashes: list[str],
+    tables: dict[str, pd.DataFrame],
+    offsets: dict[str, list[int]],
+    commit_dates: dict[str, pd.Timestamp],
+) -> None:
+    """
+    (file, same_entity, file) — bidirectional edges between snapshot file nodes
+    that correspond to the same filename in different commits.
+
+    Edge attr (4-dim): [delta_complexity, delta_loc, delta_token_count, log1p(time_gap_days)]
+    Delta is signed: B - A for the forward direction, A - B for the reverse.
+    """
+    file_info = tables.get("file_info")
+    if file_info is None:
+        _empty_edge(data, "file", "same_entity", "file")
+        data["file", "same_entity", "file"].edge_attr = torch.zeros((0, 4), dtype=torch.float32)
+        return
+
+    # Build registry: one entry per (commit, file)
+    registry: list[dict] = []
+    for i, h in enumerate(commit_hashes):
+        files = file_info[file_info["hash"] == h].reset_index(drop=True)
+        for fi, frow in files.iterrows():
+            registry.append({
+                "global_idx":  offsets["file"][i] + fi,
+                "filename":    str(frow.get("filename", "") or frow.get("new_path", "")),
+                "complexity":  float(frow.get("complexity", 0) or 0),
+                "loc":         float(frow.get("num_lines_of_code", 0) or 0),
+                "token_count": float(frow.get("token_count", 0) or 0),
+                "commit_hash": h,
+                "commit_i":    i,
+            })
+
+    by_filename: dict[str, list[dict]] = defaultdict(list)
+    for r in registry:
+        by_filename[r["filename"]].append(r)
+
+    src, dst, feats = [], [], []
+    for fname, entries in by_filename.items():
+        if len(entries) < 2:
+            continue
+        for a, b in combinations(entries, 2):
+            if a["commit_i"] == b["commit_i"]:
+                continue
+            d_cplx = b["complexity"]  - a["complexity"]
+            d_loc  = b["loc"]         - a["loc"]
+            d_tok  = b["token_count"] - a["token_count"]
+            da = commit_dates.get(a["commit_hash"])
+            db = commit_dates.get(b["commit_hash"])
+            tgap = float(np.log1p(abs((db - da).days))) if da and db else 0.0
+            src.append(a["global_idx"]); dst.append(b["global_idx"])
+            feats.append([d_cplx, d_loc, d_tok, tgap])
+            src.append(b["global_idx"]); dst.append(a["global_idx"])
+            feats.append([-d_cplx, -d_loc, -d_tok, tgap])
+
+    if src:
+        data["file", "same_entity", "file"].edge_index = torch.tensor([src, dst], dtype=torch.long)
+        data["file", "same_entity", "file"].edge_attr  = torch.tensor(feats, dtype=torch.float32)
+    else:
+        data["file", "same_entity", "file"].edge_index = torch.zeros((2, 0), dtype=torch.long)
+        data["file", "same_entity", "file"].edge_attr  = torch.zeros((0, 4), dtype=torch.float32)
+
+
+def _add_same_entity_function_edges(
+    data: HeteroData,
+    commit_hashes: list[str],
+    tables: dict[str, pd.DataFrame],
+    offsets: dict[str, list[int]],
+    commit_dates: dict[str, pd.Timestamp],
+) -> None:
+    """
+    (function, same_entity, function) — bidirectional edges between snapshot
+    function nodes with the same (filename, name) key in different commits.
+
+    Edge attr (3-dim): [delta_complexity, delta_loc, log1p(time_gap_days)]
+    """
+    function_info = tables.get("function_info")
+    if function_info is None:
+        _empty_edge(data, "function", "same_entity", "function")
+        data["function", "same_entity", "function"].edge_attr = torch.zeros((0, 3), dtype=torch.float32)
+        return
+
+    registry: list[dict] = []
+    for i, h in enumerate(commit_hashes):
+        funcs = function_info[function_info["hash"] == h].reset_index(drop=True)
+        for fi, frow in funcs.iterrows():
+            registry.append({
+                "global_idx": offsets["function"][i] + fi,
+                "key":        (str(frow.get("filename", "")), str(frow.get("name", ""))),
+                "complexity": float(frow.get("complexity", 0) or 0),
+                "loc":        float(frow.get("num_lines_of_code", 0) or 0),
+                "commit_hash": h,
+                "commit_i":   i,
+            })
+
+    by_key: dict[tuple, list[dict]] = defaultdict(list)
+    for r in registry:
+        by_key[r["key"]].append(r)
+
+    src, dst, feats = [], [], []
+    for key, entries in by_key.items():
+        if len(entries) < 2:
+            continue
+        for a, b in combinations(entries, 2):
+            if a["commit_i"] == b["commit_i"]:
+                continue
+            d_cplx = b["complexity"] - a["complexity"]
+            d_loc  = b["loc"]        - a["loc"]
+            da = commit_dates.get(a["commit_hash"])
+            db = commit_dates.get(b["commit_hash"])
+            tgap = float(np.log1p(abs((db - da).days))) if da and db else 0.0
+            src.append(a["global_idx"]); dst.append(b["global_idx"])
+            feats.append([d_cplx, d_loc, tgap])
+            src.append(b["global_idx"]); dst.append(a["global_idx"])
+            feats.append([-d_cplx, -d_loc, tgap])
+
+    if src:
+        data["function", "same_entity", "function"].edge_index = torch.tensor([src, dst], dtype=torch.long)
+        data["function", "same_entity", "function"].edge_attr  = torch.tensor(feats, dtype=torch.float32)
+    else:
+        data["function", "same_entity", "function"].edge_index = torch.zeros((2, 0), dtype=torch.long)
+        data["function", "same_entity", "function"].edge_attr  = torch.zeros((0, 3), dtype=torch.float32)
+
+
+def _add_parent_of_edges(
+    data: HeteroData,
+    commit_hashes: list[str],
+    tables: dict[str, pd.DataFrame],
+    commit_idx_map: dict[str, int],
+    commit_dates: dict[str, pd.Timestamp],
+) -> None:
+    """
+    (commit, parent_of, commit) — git DAG edges.
+    Only materialised when BOTH parent and child are in commit_hashes.
+
+    Edge attr (2-dim): [log1p(time_delta_days), is_merge]
+    Direction: parent → child (temporal forward direction).
+    """
+    commit_info = tables.get("commit_info", pd.DataFrame())
+    if commit_info.empty:
+        _empty_edge(data, "commit", "parent_of", "commit")
+        data["commit", "parent_of", "commit"].edge_attr = torch.zeros((0, 2), dtype=torch.float32)
+        return
+
+    src, dst, feats = [], [], []
+    for h, child_idx in commit_idx_map.items():
+        row = commit_info[commit_info["hash"] == h]
+        if row.empty:
+            continue
+        parents_raw = row["parents"].values[0]
+        try:
+            parents = eval(str(parents_raw)) if isinstance(parents_raw, str) else []
+        except Exception:
+            parents = []
+        if not isinstance(parents, list):
+            parents = [parents]
+        is_merge = float(len(parents) > 1)
+        for parent_hash in parents:
+            parent_hash = str(parent_hash).strip()
+            if parent_hash not in commit_idx_map:
+                continue
+            parent_idx = commit_idx_map[parent_hash]
+            dp = commit_dates.get(parent_hash)
+            dc = commit_dates.get(h)
+            time_delta = abs((dc - dp).days) if dp and dc else 0.0
+            src.append(parent_idx)
+            dst.append(child_idx)
+            feats.append([float(np.log1p(time_delta)), is_merge])
+
+    if src:
+        data["commit", "parent_of", "commit"].edge_index = torch.tensor([src, dst], dtype=torch.long)
+        data["commit", "parent_of", "commit"].edge_attr  = torch.tensor(feats, dtype=torch.float32)
+    else:
+        data["commit", "parent_of", "commit"].edge_index = torch.zeros((2, 0), dtype=torch.long)
+        data["commit", "parent_of", "commit"].edge_attr  = torch.zeros((0, 2), dtype=torch.float32)
+
+
+def _add_vcc_fc_edges(
+    data: HeteroData,
+    commit_hashes: list[str],
+    tables: dict[str, pd.DataFrame],
+    commit_idx_map: dict[str, int],
+    commit_dates: dict[str, pd.Timestamp],
+) -> None:
+    """
+    (commit, fixes, commit) — VCC → FC edges from cve_fc_vcc_mapping.
+    Only materialised when BOTH vcc and fc hashes are in commit_hashes.
+
+    Direction: VCC → FC (vulnerability causes the fix).
+    Edge attr (1-dim): [log1p(days_vcc_to_fc)]
+
+    NOTE: mask these edges at training time to avoid label leakage for the
+    target commit. They are useful for providing relational context to
+    *other* commits in the multi-commit graph.
+    """
+    vcc_fc = tables.get("vcc_fc_mapping")
+    if vcc_fc is None:
+        _empty_edge(data, "commit", "fixes", "commit")
+        data["commit", "fixes", "commit"].edge_attr = torch.zeros((0, 1), dtype=torch.float32)
+        return
+
+    commit_set = set(commit_hashes)
+    seen_pairs: set[tuple[int, int]] = set()
+    src, dst, feats = [], [], []
+
+    for _, row in vcc_fc.iterrows():
+        fc_hash = str(row.get("fc_hash", "")).strip()
+        vcc_raw = row.get("vcc_hash", "[]")
+        try:
+            vcc_list = eval(str(vcc_raw)) if isinstance(vcc_raw, str) else []
+        except Exception:
+            vcc_list = []
+        if not isinstance(vcc_list, list):
+            vcc_list = [vcc_list]
+
+        if fc_hash not in commit_set:
+            continue
+        fc_idx = commit_idx_map[fc_hash]
+
+        for vcc_hash in vcc_list:
+            vcc_hash = str(vcc_hash).strip()
+            if vcc_hash not in commit_set:
+                continue
+            vcc_idx = commit_idx_map[vcc_hash]
+            pair = (vcc_idx, fc_idx)
+            if pair in seen_pairs:
+                continue
+            seen_pairs.add(pair)
+            dv = commit_dates.get(vcc_hash)
+            df_ts = commit_dates.get(fc_hash)
+            days = abs((df_ts - dv).days) if dv and df_ts else 0.0
+            src.append(vcc_idx)
+            dst.append(fc_idx)
+            feats.append([float(np.log1p(days))])
+
+    if src:
+        data["commit", "fixes", "commit"].edge_index = torch.tensor([src, dst], dtype=torch.long)
+        data["commit", "fixes", "commit"].edge_attr  = torch.tensor(feats, dtype=torch.float32)
+    else:
+        data["commit", "fixes", "commit"].edge_index = torch.zeros((2, 0), dtype=torch.long)
+        data["commit", "fixes", "commit"].edge_attr  = torch.zeros((0, 1), dtype=torch.float32)
 
 
 if __name__ == "__main__":
