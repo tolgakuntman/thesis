@@ -24,5 +24,6 @@ data_new
 data/
 data_new/
 notebooks/movie_lens.ipynb
+notebooks/generate_demo_notebooks.py
 .claude
 *.png

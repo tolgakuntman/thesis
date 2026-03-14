@@ -9,6 +9,7 @@ import numpy as np
 import pandas as pd
 import torch
 from torch_geometric.data import HeteroData
+from tqdm.auto import tqdm
 
 OWNERSHIP_THRESHOLD = 0.05   # Bird et al. (2011) minor-contributor cutoff
 
@@ -824,6 +825,32 @@ def load_all_tables(base_path: str = "..") -> dict[str, pd.DataFrame]:
     return tables
 
 
+def get_repo_commits(
+    tables: dict[str, pd.DataFrame],
+    repo_url: str,
+) -> list[str]:
+    """
+    Return all commit hashes for *repo_url*, sorted by author_date ascending.
+
+    Parameters
+    ----------
+    tables   : dict returned by load_all_tables()
+    repo_url : repository URL as stored in commit_info (e.g.
+               'https://github.com/tensorflow/tensorflow')
+
+    Returns
+    -------
+    List of commit hashes (strings), chronologically ordered.
+    """
+    ci = tables.get("commit_info", pd.DataFrame())
+    if ci.empty or "repo_url" not in ci.columns:
+        return []
+    subset = ci[ci["repo_url"] == repo_url].copy()
+    subset["_ts"] = pd.to_datetime(subset["author_date"], utc=True, errors="coerce")
+    subset = subset.sort_values("_ts")
+    return subset["hash"].tolist()
+
+
 def _select_window_tags(
     tags: pd.DataFrame,
     commit_date: pd.Timestamp,
@@ -1108,7 +1135,7 @@ def build_multi_commit_graph(
     max_prs: Optional[int] = None,
     max_tags: Optional[int] = None,
     include_parent_edges: bool = True,
-    include_vcc_fc_edges: bool = True,
+    include_temporal_edges: bool = True,
 ) -> HeteroData:
     """
     Build a multi-commit heterogeneous graph from a list of commit hashes.
@@ -1121,29 +1148,29 @@ def build_multi_commit_graph(
       - issue/PR/tag  : snapshot per commit (same as single-commit graph)
 
     Cross-commit edges added:
-      (file, same_entity, file)
-          same filename modified in different commits
+      (file, file_evolution, file)
+          same filename — forward-only, adjacent temporal snapshots (older→newer)
           attr: [delta_complexity, delta_loc, delta_token_count, log1p(time_gap_days)]
-      (function, same_entity, function)
-          same (filename, name) in different commits
+      (function, fn_evolution, function)
+          same (filename, name) — forward-only, adjacent temporal snapshots (older→newer)
           attr: [delta_complexity, delta_loc, log1p(time_gap_days)]
       (commit, parent_of, commit)
           git DAG parent→child — both commits must be in commit_hashes
           attr: [log1p(time_delta_days), is_merge]
-      (commit, fixes, commit)
-          VCC→FC pairs from cve_fc_vcc_mapping — both must be in commit_hashes
-          attr: [log1p(days_vcc_to_fc)]
+      (commit, precedes, commit)
+          chronological chain: each commit → its immediate temporal successor
+          attr: [log1p(delta_days)]
 
     All intra-commit edge types from build_graph() are preserved with adjusted
     global node indices. Developer edges are remapped to unified developer indices.
 
     Parameters
     ----------
-    commit_hashes        : ordered list of commit SHAs to include
-    tables               : dict returned by load_all_tables()
-    mode                 : graph mode passed to build_graph() for each commit
-    include_parent_edges : add (commit, parent_of, commit) edges
-    include_vcc_fc_edges : add (commit, fixes, commit) edges
+    commit_hashes          : ordered list of commit SHAs to include
+    tables                 : dict returned by load_all_tables()
+    mode                   : graph mode passed to build_graph() for each commit
+    include_parent_edges   : add (commit, parent_of, commit) edges
+    include_temporal_edges : add (commit, precedes, commit) chronological chain edges
 
     Returns
     -------
@@ -1157,7 +1184,9 @@ def build_multi_commit_graph(
 
     # ── Step 1: per-commit subgraphs ──────────────────────────────────────────
     subgraphs: list[HeteroData] = []
-    for h in commit_hashes:
+    _show_progress = len(commit_hashes) >= 10
+    for h in tqdm(commit_hashes, desc="Building subgraphs", unit="commit",
+                  disable=not _show_progress):
         try:
             g = build_graph(
                 h, tables, mode=mode,
@@ -1362,14 +1391,14 @@ def build_multi_commit_graph(
 
     commit_idx_map = {h: i for i, h in enumerate(commit_hashes)}
 
-    _add_same_entity_file_edges(data, commit_hashes, tables, offsets, commit_dates)
-    _add_same_entity_function_edges(data, commit_hashes, tables, offsets, commit_dates)
+    _add_file_evolution_edges(data, commit_hashes, tables, offsets, commit_dates)
+    _add_fn_evolution_edges(data, commit_hashes, tables, offsets, commit_dates)
 
     if include_parent_edges:
         _add_parent_of_edges(data, commit_hashes, tables, commit_idx_map, commit_dates)
 
-    if include_vcc_fc_edges:
-        _add_vcc_fc_edges(data, commit_hashes, tables, commit_idx_map, commit_dates)
+    if include_temporal_edges:
+        _add_temporal_commit_edges(data, commit_hashes, commit_idx_map, commit_dates)
 
     # ── Metadata ──────────────────────────────────────────────────────────────
     data._commit_hashes  = commit_hashes
@@ -1378,7 +1407,7 @@ def build_multi_commit_graph(
     return data
 
 
-def _add_same_entity_file_edges(
+def _add_file_evolution_edges(
     data: HeteroData,
     commit_hashes: list[str],
     tables: dict[str, pd.DataFrame],
@@ -1386,16 +1415,20 @@ def _add_same_entity_file_edges(
     commit_dates: dict[str, pd.Timestamp],
 ) -> None:
     """
-    (file, same_entity, file) — bidirectional edges between snapshot file nodes
-    that correspond to the same filename in different commits.
+    (file, file_evolution, file) — bidirectional edges between temporally
+    adjacent snapshot file nodes with the same filename.
+
+    Only consecutive pairs (sorted by author_date) are connected, avoiding the
+    O(N²) density of all-pairs combinations while preserving the temporal chain.
+    Edges are forward-only (older → newer) to respect temporal causality.
 
     Edge attr (4-dim): [delta_complexity, delta_loc, delta_token_count, log1p(time_gap_days)]
-    Delta is signed: B - A for the forward direction, A - B for the reverse.
+    Delta is signed: newer - older (positive = growth, negative = shrinkage).
     """
     file_info = tables.get("file_info")
     if file_info is None:
-        _empty_edge(data, "file", "same_entity", "file")
-        data["file", "same_entity", "file"].edge_attr = torch.zeros((0, 4), dtype=torch.float32)
+        _empty_edge(data, "file", "file_evolution", "file")
+        data["file", "file_evolution", "file"].edge_attr = torch.zeros((0, 4), dtype=torch.float32)
         return
 
     # Build registry: one entry per (commit, file)
@@ -1417,11 +1450,18 @@ def _add_same_entity_file_edges(
     for r in registry:
         by_filename[r["filename"]].append(r)
 
+    _epoch = pd.Timestamp("1970-01-01", tz="UTC")
+
     src, dst, feats = [], [], []
     for fname, entries in by_filename.items():
         if len(entries) < 2:
             continue
-        for a, b in combinations(entries, 2):
+        # Sort by author_date so we only connect adjacent temporal snapshots
+        entries_sorted = sorted(
+            entries,
+            key=lambda e: commit_dates.get(e["commit_hash"], _epoch),
+        )
+        for a, b in zip(entries_sorted, entries_sorted[1:]):
             if a["commit_i"] == b["commit_i"]:
                 continue
             d_cplx = b["complexity"]  - a["complexity"]
@@ -1432,18 +1472,16 @@ def _add_same_entity_file_edges(
             tgap = float(np.log1p(abs((db - da).days))) if da and db else 0.0
             src.append(a["global_idx"]); dst.append(b["global_idx"])
             feats.append([d_cplx, d_loc, d_tok, tgap])
-            src.append(b["global_idx"]); dst.append(a["global_idx"])
-            feats.append([-d_cplx, -d_loc, -d_tok, tgap])
 
     if src:
-        data["file", "same_entity", "file"].edge_index = torch.tensor([src, dst], dtype=torch.long)
-        data["file", "same_entity", "file"].edge_attr  = torch.tensor(feats, dtype=torch.float32)
+        data["file", "file_evolution", "file"].edge_index = torch.tensor([src, dst], dtype=torch.long)
+        data["file", "file_evolution", "file"].edge_attr  = torch.tensor(feats, dtype=torch.float32)
     else:
-        data["file", "same_entity", "file"].edge_index = torch.zeros((2, 0), dtype=torch.long)
-        data["file", "same_entity", "file"].edge_attr  = torch.zeros((0, 4), dtype=torch.float32)
+        data["file", "file_evolution", "file"].edge_index = torch.zeros((2, 0), dtype=torch.long)
+        data["file", "file_evolution", "file"].edge_attr  = torch.zeros((0, 4), dtype=torch.float32)
 
 
-def _add_same_entity_function_edges(
+def _add_fn_evolution_edges(
     data: HeteroData,
     commit_hashes: list[str],
     tables: dict[str, pd.DataFrame],
@@ -1451,15 +1489,25 @@ def _add_same_entity_function_edges(
     commit_dates: dict[str, pd.Timestamp],
 ) -> None:
     """
-    (function, same_entity, function) — bidirectional edges between snapshot
-    function nodes with the same (filename, name) key in different commits.
+    (function, fn_evolution, function) — forward-only edges between temporally
+    adjacent snapshot function nodes with the same qualified function name.
+
+    Keyed on function name only (not filename) so that functions which move
+    between files across commits (e.g. extracted into a utility header) are
+    still correctly linked. Names are typically fully qualified (e.g.
+    'tensorflow::FooOp::Compute'), making cross-file false positives unlikely.
+
+    Only consecutive pairs (sorted by author_date) are connected, avoiding the
+    O(N²) density of all-pairs combinations while preserving the temporal chain.
+    Edges are forward-only (older → newer) to respect temporal causality.
 
     Edge attr (3-dim): [delta_complexity, delta_loc, log1p(time_gap_days)]
+    Delta is signed: newer - older (positive = growth, negative = shrinkage).
     """
     function_info = tables.get("function_info")
     if function_info is None:
-        _empty_edge(data, "function", "same_entity", "function")
-        data["function", "same_entity", "function"].edge_attr = torch.zeros((0, 3), dtype=torch.float32)
+        _empty_edge(data, "function", "fn_evolution", "function")
+        data["function", "fn_evolution", "function"].edge_attr = torch.zeros((0, 3), dtype=torch.float32)
         return
 
     registry: list[dict] = []
@@ -1468,22 +1516,29 @@ def _add_same_entity_function_edges(
         for fi, frow in funcs.iterrows():
             registry.append({
                 "global_idx": offsets["function"][i] + fi,
-                "key":        (str(frow.get("filename", "")), str(frow.get("name", ""))),
+                "key":        str(frow.get("name", "")).strip(),
                 "complexity": float(frow.get("complexity", 0) or 0),
                 "loc":        float(frow.get("num_lines_of_code", 0) or 0),
                 "commit_hash": h,
                 "commit_i":   i,
             })
 
-    by_key: dict[tuple, list[dict]] = defaultdict(list)
+    by_key: dict[str, list[dict]] = defaultdict(list)
     for r in registry:
         by_key[r["key"]].append(r)
+
+    _epoch = pd.Timestamp("1970-01-01", tz="UTC")
 
     src, dst, feats = [], [], []
     for key, entries in by_key.items():
         if len(entries) < 2:
             continue
-        for a, b in combinations(entries, 2):
+        # Sort by author_date so we only connect adjacent temporal snapshots
+        entries_sorted = sorted(
+            entries,
+            key=lambda e: commit_dates.get(e["commit_hash"], _epoch),
+        )
+        for a, b in zip(entries_sorted, entries_sorted[1:]):
             if a["commit_i"] == b["commit_i"]:
                 continue
             d_cplx = b["complexity"] - a["complexity"]
@@ -1493,15 +1548,13 @@ def _add_same_entity_function_edges(
             tgap = float(np.log1p(abs((db - da).days))) if da and db else 0.0
             src.append(a["global_idx"]); dst.append(b["global_idx"])
             feats.append([d_cplx, d_loc, tgap])
-            src.append(b["global_idx"]); dst.append(a["global_idx"])
-            feats.append([-d_cplx, -d_loc, tgap])
 
     if src:
-        data["function", "same_entity", "function"].edge_index = torch.tensor([src, dst], dtype=torch.long)
-        data["function", "same_entity", "function"].edge_attr  = torch.tensor(feats, dtype=torch.float32)
+        data["function", "fn_evolution", "function"].edge_index = torch.tensor([src, dst], dtype=torch.long)
+        data["function", "fn_evolution", "function"].edge_attr  = torch.tensor(feats, dtype=torch.float32)
     else:
-        data["function", "same_entity", "function"].edge_index = torch.zeros((2, 0), dtype=torch.long)
-        data["function", "same_entity", "function"].edge_attr  = torch.zeros((0, 3), dtype=torch.float32)
+        data["function", "fn_evolution", "function"].edge_index = torch.zeros((2, 0), dtype=torch.long)
+        data["function", "fn_evolution", "function"].edge_attr  = torch.zeros((0, 3), dtype=torch.float32)
 
 
 def _add_parent_of_edges(
@@ -1557,70 +1610,48 @@ def _add_parent_of_edges(
         data["commit", "parent_of", "commit"].edge_attr  = torch.zeros((0, 2), dtype=torch.float32)
 
 
-def _add_vcc_fc_edges(
+def _add_temporal_commit_edges(
     data: HeteroData,
     commit_hashes: list[str],
-    tables: dict[str, pd.DataFrame],
     commit_idx_map: dict[str, int],
     commit_dates: dict[str, pd.Timestamp],
 ) -> None:
     """
-    (commit, fixes, commit) — VCC → FC edges from cve_fc_vcc_mapping.
-    Only materialised when BOTH vcc and fc hashes are in commit_hashes.
+    (commit, precedes, commit) — chronological chain over all commits in the graph.
 
-    Direction: VCC → FC (vulnerability causes the fix).
-    Edge attr (1-dim): [log1p(days_vcc_to_fc)]
+    Commits are sorted by author_date and each is connected to its immediate
+    temporal successor. This replaces the label-leaking VCC→FC 'fixes' edge:
+    the temporal chain is fully constructible at inference time without any
+    knowledge of commit labels.
 
-    NOTE: mask these edges at training time to avoid label leakage for the
-    target commit. They are useful for providing relational context to
-    *other* commits in the multi-commit graph.
+    Direction: earlier commit → later commit.
+    Edge attr (1-dim): [log1p(delta_days)]
     """
-    vcc_fc = tables.get("vcc_fc_mapping")
-    if vcc_fc is None:
-        _empty_edge(data, "commit", "fixes", "commit")
-        data["commit", "fixes", "commit"].edge_attr = torch.zeros((0, 1), dtype=torch.float32)
-        return
+    _epoch = pd.Timestamp("1970-01-01", tz="UTC")
 
-    commit_set = set(commit_hashes)
-    seen_pairs: set[tuple[int, int]] = set()
+    # Sort commits by author_date
+    sorted_hashes = sorted(
+        commit_hashes,
+        key=lambda h: commit_dates.get(h, _epoch),
+    )
+
     src, dst, feats = [], [], []
-
-    for _, row in vcc_fc.iterrows():
-        fc_hash = str(row.get("fc_hash", "")).strip()
-        vcc_raw = row.get("vcc_hash", "[]")
-        try:
-            vcc_list = eval(str(vcc_raw)) if isinstance(vcc_raw, str) else []
-        except Exception:
-            vcc_list = []
-        if not isinstance(vcc_list, list):
-            vcc_list = [vcc_list]
-
-        if fc_hash not in commit_set:
-            continue
-        fc_idx = commit_idx_map[fc_hash]
-
-        for vcc_hash in vcc_list:
-            vcc_hash = str(vcc_hash).strip()
-            if vcc_hash not in commit_set:
-                continue
-            vcc_idx = commit_idx_map[vcc_hash]
-            pair = (vcc_idx, fc_idx)
-            if pair in seen_pairs:
-                continue
-            seen_pairs.add(pair)
-            dv = commit_dates.get(vcc_hash)
-            df_ts = commit_dates.get(fc_hash)
-            days = abs((df_ts - dv).days) if dv and df_ts else 0.0
-            src.append(vcc_idx)
-            dst.append(fc_idx)
-            feats.append([float(np.log1p(days))])
+    for a_hash, b_hash in zip(sorted_hashes, sorted_hashes[1:]):
+        a_idx = commit_idx_map[a_hash]
+        b_idx = commit_idx_map[b_hash]
+        da = commit_dates.get(a_hash)
+        db = commit_dates.get(b_hash)
+        days = abs((db - da).days) if da and db else 0.0
+        src.append(a_idx)
+        dst.append(b_idx)
+        feats.append([float(np.log1p(days))])
 
     if src:
-        data["commit", "fixes", "commit"].edge_index = torch.tensor([src, dst], dtype=torch.long)
-        data["commit", "fixes", "commit"].edge_attr  = torch.tensor(feats, dtype=torch.float32)
+        data["commit", "precedes", "commit"].edge_index = torch.tensor([src, dst], dtype=torch.long)
+        data["commit", "precedes", "commit"].edge_attr  = torch.tensor(feats, dtype=torch.float32)
     else:
-        data["commit", "fixes", "commit"].edge_index = torch.zeros((2, 0), dtype=torch.long)
-        data["commit", "fixes", "commit"].edge_attr  = torch.zeros((0, 1), dtype=torch.float32)
+        data["commit", "precedes", "commit"].edge_index = torch.zeros((2, 0), dtype=torch.long)
+        data["commit", "precedes", "commit"].edge_attr  = torch.zeros((0, 1), dtype=torch.float32)
 
 
 if __name__ == "__main__":
