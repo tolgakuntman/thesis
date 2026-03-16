@@ -433,8 +433,9 @@ def add_file_function_edges(
     funcs: pd.DataFrame,
 ) -> None:
     """
-    (file, has, function) — 6 features:
-    loc_frac, complexity_ratio, token_ratio, position, num_params, before_change
+    (file, has, function) — 7 features:
+    loc_frac, complexity_ratio, token_ratio, position, num_params, before_change, is_hunk
+    is_hunk=1.0 for diff-window hunk fallback nodes, 0.0 for Lizard-parsed functions.
     """
     src, dst, feats = [], [], []
     if len(funcs) > 0:
@@ -455,16 +456,17 @@ def add_file_function_edges(
             except TypeError:
                 params = 0
             before_change = float(fnrow.get("before_change", False))
+            is_hunk       = float(fnrow.get("is_hunk", False))
             src.append(fi); dst.append(fni)
             feats.append([loc_frac, complexity_ratio, token_ratio,
-                          position, float(params), before_change])
+                          position, float(params), before_change, is_hunk])
 
     if src:
         data["file", "has", "function"].edge_index = torch.tensor([src, dst], dtype=torch.long)
         data["file", "has", "function"].edge_attr  = torch.tensor(feats, dtype=torch.float32)
     else:
         data["file", "has", "function"].edge_index = torch.zeros((2, 0), dtype=torch.long)
-        data["file", "has", "function"].edge_attr  = torch.zeros((0, 6), dtype=torch.float32)
+        data["file", "has", "function"].edge_attr  = torch.zeros((0, 7), dtype=torch.float32)
 
 
 def add_function_comod_edges(
@@ -796,7 +798,15 @@ def add_temporal_edges(
 
 
 def load_all_tables(base_path: str = "..") -> dict[str, pd.DataFrame]:
-    """Load all required DataFrames from base_path (thesis root directory)."""
+    """Load all required DataFrames from base_path (thesis root directory).
+
+    Uses v2 data (function_info_v2_merged, file_info_v2_merged) when available,
+    falling back to the old v1 files.  The v2 function table is filtered to
+    canonical rows only:
+      - FC commits  → before_change == False  (patched state)
+      - VCC commits → before_change == True   (vulnerable state)
+    This prevents duplicate / wrong-state function nodes.
+    """
     import os
     p = base_path
     g = os.path.join(p, "data", "graph_data")   # symlinked graph data
@@ -811,8 +821,49 @@ def load_all_tables(base_path: str = "..") -> dict[str, pd.DataFrame]:
             tables[key] = None
 
     _load(os.path.join(p, "data/processed/commit_info.csv"),          "commit_info")
-    _load(os.path.join(p, "data_new/processed/file_info_new.csv"),    "file_info")
-    _load(os.path.join(p, "data_new/processed/function_info_new.csv"),"function_info")
+
+    # Prefer v2 file/function tables; fall back to old files if v2 not present
+    fi_v2  = os.path.join(p, "data_new/processed/file_info_v2_merged.csv")
+    fn_v2  = os.path.join(p, "data_new/processed/function_info_v2_merged.csv")
+    fi_old = os.path.join(p, "data_new/processed/file_info_new.csv")
+    fn_old = os.path.join(p, "data_new/processed/function_info_new.csv")
+
+    if os.path.exists(fi_v2):
+        tables["file_info"] = pd.read_csv(fi_v2)
+    else:
+        _load(fi_old, "file_info")
+
+    if os.path.exists(fn_v2):
+        fn_df = pd.read_csv(fn_v2)
+        # Keep canonical rows: FC→after-fix state, VCC→pre-fix state
+        # Then deduplicate: VCCs linked to multiple FC chains are extracted
+        # once per FC anchor, producing exact-duplicate rows for the same
+        # (hash, function name, filename). Drop the extras.
+        fn_canon = fn_df[
+            ((fn_df["commit_label"] == "FC")  & (fn_df["before_change"] == False)) |
+            ((fn_df["commit_label"] == "VCC") & (fn_df["before_change"] == True))
+        ].drop_duplicates(subset=["hash", "name", "filename"])
+        fn_canon = fn_canon.assign(is_hunk=False)
+
+        # Append hunk rows for commits that have no function-level data.
+        # Hunks are diff-window fallbacks (headers, macros, assembly) where
+        # Lizard found zero functions. They use the same feature columns.
+        hunk_v2 = os.path.join(p, "data_new/processed/hunk_info_v2_merged.csv")
+        if os.path.exists(hunk_v2):
+            hunk_df = pd.read_csv(hunk_v2)
+            covered = set(fn_canon["hash"].unique())
+            hunk_rows = hunk_df[~hunk_df["hash"].isin(covered)].copy()
+            hunk_rows = hunk_rows.assign(is_hunk=True)
+            # Align columns: drop hunk-only column, keep shared ones
+            shared_cols = [c for c in fn_canon.columns if c in hunk_rows.columns]
+            tables["function_info"] = pd.concat(
+                [fn_canon, hunk_rows[shared_cols]], ignore_index=True
+            )
+        else:
+            tables["function_info"] = fn_canon.reset_index(drop=True)
+    else:
+        _load(fn_old, "function_info")
+
     _load(os.path.join(p, "data_new/processed/ownership_window.csv"), "ownership_window")
     _load(os.path.join(p, "data/_cleaned/developer_info_clean.csv"),  "developer_info")
     _load(os.path.join(p, "data/_cleaned/commit_author_clean.csv"),   "commit_author")

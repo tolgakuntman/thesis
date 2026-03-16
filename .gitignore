@@ -27,3 +27,4 @@ notebooks/movie_lens.ipynb
 notebooks/generate_demo_notebooks.py
 .claude
 *.png
+DATA_V2_CHANGELOG.md
