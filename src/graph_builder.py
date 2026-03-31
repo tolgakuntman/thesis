@@ -337,6 +337,10 @@ def add_developer_nodes(
     if developer_info is not None and n_devs > 0:
         di = developer_info.copy()
         di["_email"] = di["dev_id"].str.strip().str.lower()
+        # Keep one row per email — if duplicates exist, take the one with highest total_commits
+        if "total_commits" in di.columns:
+            di = di.sort_values("total_commits", ascending=False)
+        di = di.drop_duplicates(subset=["_email"])
         di = di.set_index("_email")
         for email, idx in email_to_dev_idx.items():
             if email in di.index:
@@ -424,12 +428,21 @@ def add_tag_nodes(
             next_name = cfr.get("next_tag_name", None)
             prev_days = cfr.get("days_since_prev_tag", None)
             next_days = cfr.get("days_to_next_tag", None)
+            # For normal commits, prev_tag_name may be NaN even when days_since_prev_tag>0
+            # (tag names not captured in the simplified normal-commit SDLC pipeline).
+            # Fall back to a placeholder name so we still get a node with temporal distance.
+            _prev_name_eff = prev_name if pd.notna(prev_name) else (
+                "v0.0" if (pd.notna(prev_days) and float(prev_days) > 0) else None
+            )
+            _next_name_eff = next_name if pd.notna(next_name) else (
+                "v0.0" if (pd.notna(next_days) and float(next_days) > 0) else None
+            )
             prev_parsed = parse_tag_features(
-                prev_name,
+                _prev_name_eff,
                 -float(prev_days) if pd.notna(prev_days) else 0.0,  # negative = before
             )
             next_parsed = parse_tag_features(
-                next_name,
+                _next_name_eff,
                 float(next_days) if pd.notna(next_days) else 0.0,   # positive = after
             )
             if prev_parsed is not None:
@@ -864,25 +877,30 @@ def add_temporal_edges(
 def load_all_tables(
     base_path: str = "..",
     commit_hashes: Optional[list[str]] = None,
+    use_full: bool = True,
 ) -> dict[str, pd.DataFrame]:
     """Load all required DataFrames from base_path (thesis root directory).
 
-    Function/hunk data loading priority:
-      1. v4 (data_new/processed_v4_fixed/) — preferred; 74k rows, has REFACTOR
-      2. v3 (data/graph_data/function_info_new.csv) — fallback; 41k rows
-      3. v2 fallback appended for VCC commits absent from v3/v4
+    use_full=True (default): loads *_full.csv tables that include VCC + FC + normal commits.
+    use_full=False: legacy behaviour loading VCC/FC-only tables (for demos/visualisation).
+
+    Function/hunk data loading priority (use_full=True):
+      1. function_info_full.csv (data_new/processed_v4_fixed/) — 269k rows, all commit types
+      2. Falls back to v4_merged → v3 if not found
 
     Canonical filter (per DATA_README.md):
-      - FC:       before_change=False  (after-fix / patched state)
-      - VCC+ADD:  before_change=False  (the newly added function IS the vulnerability)
-      - VCC+other: before_change=True  (pre-change snapshot = vulnerable state)
+      - FC/normal: before_change=False  (post-change / unrelated state)
+      - VCC+ADD:   before_change=False  (newly added function IS the vulnerability)
+      - VCC+other: before_change=True   (pre-change snapshot = vulnerable state)
     v3 note: in v3, VCC+ADD rows are stored with before_change=True (different convention
              than v4). The filter adapts automatically based on which source is loaded.
 
     Loading rules:
-      - file_info  : apply defensive change_type normalisation
+      - file_info  : apply defensive change_type normalisation; skip large text cols (diff/code)
       - function_info : canonical filter above; dedup on [hash, commit_label, name, filename, start_line, before_change]
       - hunk_info  : merged unconditionally; is_hunk=True on hunk rows
+      - commit_features : merges old VCC/FC schema (28-col) with normal schema (16-col),
+                          aligning column names (time_since_last_tag → days_since_prev_tag)
     """
     import os
     p = base_path
@@ -920,12 +938,37 @@ def load_all_tables(
         tables[key] = df
 
     # ── commit-level ──────────────────────────────────────────────────────────
-    _load(os.path.join(g, "commit_info.csv"), "commit_info")
+    _ci_full = os.path.join(g, "commit_info_full.csv")
+    _ci_base = os.path.join(g, "commit_info.csv")
+    _load(_ci_full if (use_full and os.path.exists(_ci_full)) else _ci_base, "commit_info")
 
-    # ── file_info (v3) ────────────────────────────────────────────────────────
-    fi_path = os.path.join(g, "file_info_new.csv")
-    if os.path.exists(fi_path):
-        fi_df = pd.read_csv(fi_path)
+    # ── file_info ─────────────────────────────────────────────────────────────
+    # use_full: load file_info_full.csv (VCC+FC+normal, ~124k rows) from data_new/.
+    #   Skip large text columns (diff, diff_parsed, code_after, code_before) to
+    #   avoid loading 9+ GB into memory.
+    # legacy: load file_info_new.csv (v3, VCC+FC only) with v2 gap-fill.
+    _FI_USECOLS = [
+        "hash", "commit_label", "filename", "old_path", "new_path", "change_type",
+        "num_lines_added", "num_lines_deleted", "num_method_changed",
+        "num_lines_of_code", "complexity", "token_count",
+    ]
+    fi_full_path = os.path.join(p, "data_new/processed_v4_fixed/file_info_full.csv")
+    fi_v3_path   = os.path.join(g, "file_info_new.csv")
+
+    if use_full and os.path.exists(fi_full_path):
+        _all_cols = pd.read_csv(fi_full_path, nrows=0).columns.tolist()
+        _usecols  = [c for c in _FI_USECOLS if c in _all_cols]
+        fi_df = pd.read_csv(fi_full_path, usecols=_usecols, low_memory=False)
+        fi_df["change_type"] = (
+            fi_df["change_type"]
+            .str.replace("ModificationType.", "", regex=False)
+            .str.replace("MODIFIED", "MODIFY", regex=False)
+        )
+        fi_df = fi_df.drop_duplicates(subset=["hash", "commit_label", "filename"])
+        tables["file_info"] = fi_df.reset_index(drop=True)
+        print(f"  [file_info] loaded full: {len(fi_df)} rows")
+    elif os.path.exists(fi_v3_path):
+        fi_df = pd.read_csv(fi_v3_path)
         fi_df["change_type"] = (
             fi_df["change_type"]
             .str.replace("ModificationType.", "", regex=False)
@@ -933,7 +976,7 @@ def load_all_tables(
         )
         fi_df = fi_df.drop_duplicates(subset=["hash", "commit_label", "filename"])
 
-        # ── v2 fallback: supplement VCC commits absent from v3 file_info ──────
+        # v2 fallback: supplement VCC commits absent from v3 file_info
         v2_fi_path = os.path.join(p, "data/processed_v2/file_info_v2_merged.csv")
         if os.path.exists(v2_fi_path):
             v2_fi = pd.read_csv(v2_fi_path)
@@ -954,17 +997,24 @@ def load_all_tables(
 
         tables["file_info"] = fi_df.reset_index(drop=True)
     else:
-        print(f"  [warning] file_info not found at {fi_path}")
+        print(f"  [warning] file_info not found at {fi_full_path} or {fi_v3_path}")
         tables["file_info"] = None
 
-    # ── function_info + hunk_info (v4 preferred, v3 fallback) ────────────────
+    # ── function_info + hunk_info ─────────────────────────────────────────────
+    # use_full: prefer function_info_full.csv (269k rows, all commit types)
+    fn_full_path = os.path.join(p, "data_new/processed_v4_fixed/function_info_full.csv")
     v4_fn_path   = os.path.join(p, "data_new/processed_v4_fixed/function_info_v4_merged.csv")
     v3_fn_path   = os.path.join(g, "function_info_new.csv")
     v4_hunk_path = os.path.join(p, "data_new/processed_v4_fixed/hunk_info_v4_merged.csv")
     v3_hunk_path = os.path.join(p, "data_new/processed_v3/hunk_info_v3_merged.csv")
 
     # Select primary source
-    if os.path.exists(v4_fn_path):
+    if use_full and os.path.exists(fn_full_path):
+        fn_path   = fn_full_path
+        hunk_path = v4_hunk_path if os.path.exists(v4_hunk_path) else v3_hunk_path
+        is_v4     = True
+        print("  [function_info] loading full (VCC+FC+normal)")
+    elif os.path.exists(v4_fn_path):
         fn_path   = v4_fn_path
         hunk_path = v4_hunk_path if os.path.exists(v4_hunk_path) else v3_hunk_path
         is_v4     = True
@@ -1002,8 +1052,9 @@ def load_all_tables(
                 (fn_df["before_change"] == False)
             )
             fn_canon = fn_df[
-                ((fn_df["commit_label"] == "FC")  & (fn_df["before_change"] == False)) |
-                ((fn_df["commit_label"] == "VCC") & (fn_df["before_change"] == True)) |
+                ((fn_df["commit_label"] == "FC")     & (fn_df["before_change"] == False)) |
+                ((fn_df["commit_label"] == "normal") & (fn_df["before_change"] == False)) |
+                ((fn_df["commit_label"] == "VCC")    & (fn_df["before_change"] == True)) |
                 _vcc_add_mask |
                 _vcc_rename_mask
             ].drop_duplicates(
@@ -1124,18 +1175,58 @@ def load_all_tables(
         tables["function_info"] = None
 
     # ── ownership ─────────────────────────────────────────────────────────────
-    _load(os.path.join(g, "ownership_window.csv"), "ownership_window")
+    _ow_full = os.path.join(g, "ownership_window_full.csv")
+    _ow_base = os.path.join(g, "ownership_window.csv")
+    _load(_ow_full if (use_full and os.path.exists(_ow_full)) else _ow_base, "ownership_window")
 
     # ── developer / author ────────────────────────────────────────────────────
+    dev_full     = os.path.join(g, "developer_info_full.csv")
     dev_primary  = os.path.join(p, "data/processed/developer_info_commits.csv")
     dev_fallback = os.path.join(g, "developer_info_clean.csv")
-    _load(dev_primary if os.path.exists(dev_primary) else dev_fallback, "developer_info")
+    if use_full and os.path.exists(dev_full):
+        _load(dev_full, "developer_info")
+    else:
+        _load(dev_primary if os.path.exists(dev_primary) else dev_fallback, "developer_info")
 
+    ca_full     = os.path.join(g, "commit_author_full.csv")
     ca_primary  = os.path.join(p, "data/processed/commit_author.csv")
     ca_fallback = os.path.join(g, "commit_author_clean.csv")
-    _load(ca_primary if os.path.exists(ca_primary) else ca_fallback, "commit_author")
+    if use_full and os.path.exists(ca_full):
+        _load(ca_full, "commit_author")
+    else:
+        _load(ca_primary if os.path.exists(ca_primary) else ca_fallback, "commit_author")
 
-    _load(os.path.join(p, "data/sdlc_features/final_commit_level_features.csv"), "commit_features")
+    # ── commit-level SDLC features ────────────────────────────────────────────
+    # The old VCC/FC features file (28 cols) has full tag info (prev/next tag names,
+    # days_since_prev_tag, days_to_next_tag, release_cycle_position).
+    # The full features file (16 cols) covers all commit types but uses a simplified
+    # schema: time_since_last_tag (= days_since_prev_tag), no days_to_next_tag/tag names.
+    # Strategy: merge both — prefer old file for VCC/FC (full schema), supplement with
+    # full file for normal commits after renaming time_since_last_tag → days_since_prev_tag.
+    _cf_old  = os.path.join(p, "data/sdlc_features/final_commit_level_features.csv")
+    _cf_full = os.path.join(g, "final_commit_level_features_full.csv")
+
+    if use_full and os.path.exists(_cf_full):
+        cf_full = pd.read_csv(_cf_full)
+        # Align column name used by normal-commit extraction script → graph_builder name
+        if "time_since_last_tag" in cf_full.columns and "days_since_prev_tag" not in cf_full.columns:
+            cf_full = cf_full.rename(columns={"time_since_last_tag": "days_since_prev_tag"})
+        if os.path.exists(_cf_old):
+            cf_old = pd.read_csv(_cf_old)
+            # Supplement: add normal-commit rows that are absent from the old VCC/FC file
+            normal_hashes = set(cf_full["hash"]) - set(cf_old["hash"])
+            cf_new_only   = cf_full[cf_full["hash"].isin(normal_hashes)]
+            tables["commit_features"] = pd.concat(
+                [cf_old, cf_new_only], ignore_index=True
+            )
+        else:
+            tables["commit_features"] = cf_full
+        print(f"  [commit_features] {len(tables['commit_features'])} rows loaded (full merge)")
+    elif os.path.exists(_cf_old):
+        _load(_cf_old, "commit_features")
+    else:
+        print(f"  [warning] commit_features not found")
+        tables["commit_features"] = None
     # Large SDLC tables: drop text columns never used as GNN features, and
     # pre-filter to requested commits when commit_hashes is provided.
     # issue_info: drop opened_by_dev_id (identifier, unused), labels (text, unused)

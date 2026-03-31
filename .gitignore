@@ -31,3 +31,7 @@ notebooks/generate_demo_notebooks.py
 docs/
 scripts/
 notebooks/function_change_types_test.ipynb
+CLAUDE.md
+checkpoints/
+*.out
+AGENTS.md
