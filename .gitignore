@@ -1,37 +1,53 @@
+# ── data & outputs (large, reproducible from scripts) ─────────────────────────
+# data and data_new are symlinks to ICVul/ICVul++ — ignore both symlink and dir forms
+data
 data/
+data_new
+data_new/
 outputs/
 models/
+checkpoints/
+
+# ── binary / serialized formats ───────────────────────────────────────────────
+*.npy
 *.parquet
 *.feather
 *.arrow
 *.pkl
 *.joblib
 
+# ── Python ────────────────────────────────────────────────────────────────────
 __pycache__/
-src/__pycache__/
+**/__pycache__/
 *.pyc
 *.pyo
 *.pyd
 *.egg-info/
+
+# ── environments ──────────────────────────────────────────────────────────────
 .venv/
 .env
-env/
-.ipynb_checkpoints/
+
+# ── OS / editor ───────────────────────────────────────────────────────────────
 .DS_Store
 Thumbs.db
-ml-latest-small/
-data
-data_new
-data/
-data_new/
-notebooks/movie_lens.ipynb
-notebooks/generate_demo_notebooks.py
-.claude
-*.png
-docs/
-scripts/
-notebooks/function_change_types_test.ipynb
-CLAUDE.md
-checkpoints/
 *.out
+
+# ── notebooks (specific files not worth tracking) ─────────────────────────────
+.ipynb_checkpoints/
+notebooks/movie_lens.ipynb
+notebooks/function_change_types_test.ipynb
+notebooks/generate_demo_notebooks.py
+
+# ── Claude Code tooling (local only) ──────────────────────────────────────────
+.claude/
 AGENTS.md
+CLAUDE.md
+env/
+# ── images (regenerated from notebooks/scripts) ───────────────────────────────
+*.png
+
+# ── misc legacy ───────────────────────────────────────────────────────────────
+ml-latest-small/
+
+docs/

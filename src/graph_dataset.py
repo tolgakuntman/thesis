@@ -21,18 +21,133 @@ Split types:
     'temporal_split' — train: earliest 70%, val: next 15%, test: latest 15% by author_date
 """
 
+import json
 import warnings
 from pathlib import Path
 
+import numpy as np
 import pandas as pd
 import torch
 from torch.utils.data import WeightedRandomSampler
 from torch_geometric.data import Dataset
 from torch_geometric.loader import DataLoader
+from src.model import EDGE_ATTR_DIMS
 
 ROOT        = Path(__file__).parents[1]
-GRAPHS_DIR  = ROOT / "data_new" / "graph_ready" / "graphs"
-SPLIT_INDEX = ROOT / "data_new" / "graph_ready" / "split_index.csv"
+LEGACY_GRAPHS_DIR = ROOT / "data_new" / "graph_ready" / "graphs"
+LEGACY_SPLIT_INDEX = ROOT / "data_new" / "graph_ready" / "split_index.csv"
+FINAL_GRAPHS_DIR = ROOT / "outputs" / "final_graph_ready" / "graphs"
+FINAL_SPLIT_INDEX = ROOT / "outputs" / "final_graph_ready" / "split_index.csv"
+
+
+def _default_graphs_dir() -> Path:
+    if FINAL_GRAPHS_DIR.exists() and FINAL_SPLIT_INDEX.exists():
+        return FINAL_GRAPHS_DIR
+    return LEGACY_GRAPHS_DIR
+
+
+def _default_split_index() -> Path:
+    if FINAL_GRAPHS_DIR.exists() and FINAL_SPLIT_INDEX.exists():
+        return FINAL_SPLIT_INDEX
+    return LEGACY_SPLIT_INDEX
+
+
+GRAPHS_DIR = _default_graphs_dir()
+SPLIT_INDEX = _default_split_index()
+PERREPO_SCALER = ROOT / "outputs" / "final_graph_ready" / "perrepo_function_scaler.json"
+
+# Per-repo normalization groups for continuous numeric features only.
+# Binary indicators and one-hot change-type features are intentionally excluded.
+_PERREPO_GROUPS: dict[str, dict[str, object]] = {
+    "commit_node": {
+        "kind": "node",
+        "target": "commit",
+        "idxs": [2, 3, 4, 5, 6, 7, 8, 9, 10],
+    },
+    "fn_node": {
+        "kind": "node",
+        "target": "function",
+        "idxs": [0, 1, 2, 3, 4],
+    },
+    "file_node": {
+        "kind": "node",
+        "target": "file",
+        "idxs": [0, 1, 2],
+    },
+    "hunk_node": {
+        "kind": "node",
+        "target": "hunk",
+        "idxs": [1, 2],
+    },
+    "dev_node": {
+        "kind": "node",
+        "target": "developer",
+        "idxs": [0, 1, 2, 3, 4],
+    },
+    "issue_node": {
+        "kind": "node",
+        "target": "issue",
+        "idxs": [0, 1, 2, 3],
+    },
+    "pr_node": {
+        "kind": "node",
+        "target": "pull_request",
+        "idxs": [0, 1, 2, 3],
+    },
+    "tag_node": {
+        "kind": "node",
+        "target": "release_tag",
+        "idxs": [0, 1, 2, 3],
+    },
+    "commit_file_edge": {
+        "kind": "edge",
+        "target": ("commit", "modifies_file", "file"),
+        "rev_target": ("file", "in_commit", "commit"),
+        "idxs": [0, 1, 2, 3],
+    },
+    "commit_fn_edge": {
+        "kind": "edge",
+        "target": ("commit", "modifies_func", "function"),
+        "rev_target": ("function", "in_commit_fn", "commit"),
+        "idxs": [0, 1, 2, 3, 4, 5],
+    },
+    "author_edge": {
+        "kind": "edge",
+        "target": ("commit", "authored_by", "developer"),
+        "rev_target": ("developer", "authored", "commit"),
+        "idxs": [0, 1],
+    },
+    "committer_edge": {
+        "kind": "edge",
+        "target": ("commit", "committed_by", "developer"),
+        "rev_target": ("developer", "committed", "commit"),
+        "idxs": [0, 1],
+    },
+    "owns_edge": {
+        "kind": "edge",
+        "target": ("developer", "owns", "file"),
+        "rev_target": ("file", "owned_by", "developer"),
+        "idxs": [0, 1, 2],
+    },
+    "issue_edge": {
+        "kind": "edge",
+        "target": ("commit", "has_issue", "issue"),
+        "rev_target": ("issue", "linked_to_commit", "commit"),
+        "idxs": [0, 1],
+    },
+    "pr_edge": {
+        "kind": "edge",
+        "target": ("commit", "has_pr", "pull_request"),
+        "rev_target": ("pull_request", "linked_to_commit", "commit"),
+        "idxs": [0, 1],
+    },
+    "tag_edge": {
+        "kind": "edge",
+        "target": ("commit", "has_release", "release_tag"),
+        "rev_target": ("release_tag", "release_of", "commit"),
+        "idxs": [0],
+    },
+}
 
 
 class VulnCommitDataset(Dataset):
@@ -60,6 +175,12 @@ class VulnCommitDataset(Dataset):
         ablate_fn_categorical: bool = False,
         ablate_fn_code_metrics: bool = False,
         ablate_file_code_metrics: bool = False,
+        ablate_sdlc: bool = False,
+        perrepo_norm: bool = False,
+        keep_sdlc_developer_only: bool = False,
+        keep_sdlc_issue_pr_tag_only: bool = False,
+        keep_sdlc_edge_only: bool = False,
+        keep_sdlc_node_only: bool = False,
     ):
         super().__init__()
         assert split_type in ("repo_split", "temporal_split"), \
@@ -75,10 +196,45 @@ class VulnCommitDataset(Dataset):
         self.ablate_fn_categorical = ablate_fn_categorical
         self.ablate_fn_code_metrics = ablate_fn_code_metrics
         self.ablate_file_code_metrics = ablate_file_code_metrics
+        self.ablate_sdlc = ablate_sdlc
+        self.perrepo_norm = perrepo_norm
+        self.keep_sdlc_developer_only = keep_sdlc_developer_only
+        self.keep_sdlc_issue_pr_tag_only = keep_sdlc_issue_pr_tag_only
+        self.keep_sdlc_edge_only = keep_sdlc_edge_only
+        self.keep_sdlc_node_only = keep_sdlc_node_only
 
         df = pd.read_csv(split_index_path or SPLIT_INDEX)
         mask = df[split_type] == split
-        self.records = df[mask][["hash", "label"]].reset_index(drop=True)
+        self.records = df[mask][["hash", "label", "repo_url"]].reset_index(drop=True)
+
+        # Per-repo normalization: load scaler params and build per-group lookup tensors.
+        # Structure: self._pr[group][repo_url] = (mean_tensor, std_tensor)
+        # Fallback (unknown repo) = (zeros, ones) → z_repo = (z_global - 0) / 1 = no-op.
+        self._pr: dict[str, dict[str, tuple[torch.Tensor, torch.Tensor]]] = {}
+        if perrepo_norm:
+            if not PERREPO_SCALER.exists():
+                raise FileNotFoundError(
+                    f"Per-repo scaler not found: {PERREPO_SCALER}\n"
+                    "Run: conda run -n thesis python scripts/compute_perrepo_scaler.py"
+                )
+            with open(PERREPO_SCALER) as f:
+                raw = json.load(f)
+            for group, spec in _PERREPO_GROUPS.items():
+                group_data = raw.get(group, {})
+                idxs = spec["idxs"]
+                lookup: dict[str, tuple[torch.Tensor, torch.Tensor]] = {}
+                for repo_url, params in group_data.items():
+                    if "mean" in params and "std" in params:
+                        means = params.get("mean", [0.0] * len(idxs))
+                        stds = params.get("std", [1.0] * len(idxs))
+                    else:
+                        means = [v.get("mean", 0.0) for _, v in sorted(params.items())]
+                        stds = [v.get("std", 1.0) for _, v in sorted(params.items())]
+                    lookup[repo_url] = (
+                        torch.tensor(means, dtype=torch.float32),
+                        torch.tensor(stds, dtype=torch.float32),
+                    )
+                self._pr[group] = lookup
 
         n_pos = int(self.records["label"].sum())
         n_neg = len(self.records) - n_pos
@@ -96,6 +252,7 @@ class VulnCommitDataset(Dataset):
     def get(self, idx: int):
         row = self.records.iloc[idx]
         path = self.graphs_dir / f"{row['hash']}.pt"
+        repo_url = row.get("repo_url", "")
         # weights_only=False required for HeteroData objects
         with warnings.catch_warnings():
             warnings.simplefilter("ignore", FutureWarning)
@@ -104,21 +261,58 @@ class VulnCommitDataset(Dataset):
         for store in data.node_stores:
             if store.x is not None and store.x.numel() > 0:
                 store.x = torch.nan_to_num(store.x, nan=0.0, posinf=0.0, neginf=0.0)
-        # Ablation: zero out GraphCodeBERT dims (dims 10–777) in function nodes
+        # Per-repo re-normalization: z_repo = (z_global - repo_mean) / repo_std
+        # Fallback for unknown repos: mean=0, std=1 → identity (no change).
+        if self.perrepo_norm:
+            _zero1 = torch.zeros(1, dtype=torch.float32)
+            _one1  = torch.ones(1,  dtype=torch.float32)
+
+            def _renorm(tensor: torch.Tensor | None, group: str) -> None:
+                if tensor is None or tensor.numel() == 0:
+                    return
+                lookup = self._pr.get(group, {})
+                idxs = _PERREPO_GROUPS[group]["idxs"]
+                if tensor.size(1) <= max(idxs):
+                    return
+                n_feat = len(idxs)
+                fallback_m = torch.zeros(n_feat, dtype=torch.float32)
+                fallback_s = torch.ones(n_feat,  dtype=torch.float32)
+                m, s = lookup.get(repo_url, (fallback_m, fallback_s))
+                idx_t = torch.tensor(idxs, dtype=torch.long)
+                tensor[:, idx_t] = (tensor[:, idx_t] - m) / s
+
+            for group, spec in _PERREPO_GROUPS.items():
+                if spec["kind"] == "node":
+                    _renorm(data[spec["target"]].x, group)
+                else:
+                    _renorm(getattr(data[spec["target"]], "edge_attr", None), group)
+                    rev_target = spec.get("rev_target")
+                    if rev_target is not None:
+                        _renorm(getattr(data[rev_target], "edge_attr", None), group)
+        # Backfill missing edge_attr tensors so all graphs are collatable.
+        # The builder only writes edge_attr when edges exist; empty-edge graphs
+        # get none. PyG's Batch.from_data_list requires consistent keys.
+        for et, dim in EDGE_ATTR_DIMS.items():
+            store = data[et]
+            if not hasattr(store, "edge_attr") or store.edge_attr is None:
+                n_edges = store.edge_index.size(1) if hasattr(store, "edge_index") else 0
+                store.edge_attr = torch.zeros((n_edges, dim), dtype=torch.float32)
+        # Ablation: zero out the trailing 768 function-embedding dims
         if self.ablate_code_emb:
             fn_x = data["function"].x
-            if fn_x is not None and fn_x.numel() > 0 and fn_x.size(1) > 10:
-                fn_x[:, 10:] = 0.0
-        # Zero out commit message embedding (dims 6–773), keep 6 numeric dims
+            if fn_x is not None and fn_x.numel() > 0 and fn_x.size(1) >= 768:
+                fn_x[:, -768:] = 0.0
+        # Zero out the trailing 768 commit-message embedding dims, keep intrinsic commit features
         if self.ablate_msg_emb:
             commit_x = data["commit"].x
-            if commit_x is not None and commit_x.numel() > 0 and commit_x.size(1) > 6:
-                commit_x[:, 6:] = 0.0
-        # Zero out fct_* one-hot dims 5–9 in function nodes
+            if commit_x is not None and commit_x.numel() > 0 and commit_x.size(1) >= 768:
+                commit_x[:, -768:] = 0.0
+        # Zero out fct_* dims on commit<->function edge attrs
         if self.ablate_fn_categorical:
-            fn_x = data["function"].x
-            if fn_x is not None and fn_x.numel() > 0:
-                fn_x[:, 5:10] = 0.0
+            for et in [("commit", "modifies_func", "function"), ("function", "in_commit_fn", "commit")]:
+                ea = getattr(data[et], "edge_attr", None)
+                if ea is not None and ea.numel() > 0 and ea.size(1) >= 11:
+                    ea[:, 6:11] = 0.0
         # Zero out function code metric dims 0–4: LOC, complexity, token_count, length, nesting
         if self.ablate_fn_code_metrics:
             fn_x = data["function"].x
@@ -129,6 +323,66 @@ class VulnCommitDataset(Dataset):
             file_x = data["file"].x
             if file_x is not None and file_x.numel() > 0:
                 file_x[:, 0:3] = 0.0
+        # Zero out all SDLC node features: issue, pull_request, release_tag
+        if self.ablate_sdlc:
+            for nt in ("issue", "pull_request", "release_tag"):
+                x = data[nt].x
+                if x is not None and x.numel() > 0:
+                    x[:] = 0.0
+        # Keep only developer-side SDLC context: remove issue/PR/tag node and edge attrs.
+        if self.keep_sdlc_developer_only:
+            for nt in ("issue", "pull_request", "release_tag"):
+                x = data[nt].x
+                if x is not None and x.numel() > 0:
+                    x[:] = 0.0
+            for et in [
+                ("commit", "has_issue", "issue"),
+                ("issue", "linked_to_commit", "commit"),
+                ("commit", "has_pr", "pull_request"),
+                ("pull_request", "linked_to_commit", "commit"),
+                ("commit", "has_release", "release_tag"),
+                ("release_tag", "release_of", "commit"),
+            ]:
+                ea = getattr(data[et], "edge_attr", None)
+                if ea is not None and ea.numel() > 0:
+                    ea[:] = 0.0
+        # Keep only issue/PR/tag SDLC context: remove developer-side SDLC node and edge attrs.
+        if self.keep_sdlc_issue_pr_tag_only:
+            x = data["developer"].x
+            if x is not None and x.numel() > 0:
+                x[:] = 0.0
+            for et in [
+                ("commit", "authored_by", "developer"),
+                ("developer", "authored", "commit"),
+                ("commit", "committed_by", "developer"),
+                ("developer", "committed", "commit"),
+            ]:
+                ea = getattr(data[et], "edge_attr", None)
+                if ea is not None and ea.numel() > 0:
+                    ea[:] = 0.0
+        # Edge-only SDLC: zero SDLC node features, keep relation edge attrs.
+        if self.keep_sdlc_edge_only:
+            for nt in ("developer", "issue", "pull_request", "release_tag"):
+                x = data[nt].x
+                if x is not None and x.numel() > 0:
+                    x[:] = 0.0
+        # Node-only SDLC: keep SDLC node features, zero SDLC relation edge attrs.
+        if self.keep_sdlc_node_only:
+            for et in [
+                ("commit", "authored_by", "developer"),
+                ("developer", "authored", "commit"),
+                ("commit", "committed_by", "developer"),
+                ("developer", "committed", "commit"),
+                ("commit", "has_issue", "issue"),
+                ("issue", "linked_to_commit", "commit"),
+                ("commit", "has_pr", "pull_request"),
+                ("pull_request", "linked_to_commit", "commit"),
+                ("commit", "has_release", "release_tag"),
+                ("release_tag", "release_of", "commit"),
+            ]:
+                ea = getattr(data[et], "edge_attr", None)
+                if ea is not None and ea.numel() > 0:
+                    ea[:] = 0.0
         data.y = torch.tensor([int(row["label"])], dtype=torch.long)
         return data
 
@@ -151,31 +405,49 @@ def make_loader(
     num_workers: int = 4,
     is_train: bool = True,
     pin_memory: bool = True,
+    repo_balanced: bool = False,
 ) -> DataLoader:
     """
     Build a DataLoader for the given dataset split.
 
     For training: uses WeightedRandomSampler to balance VCC:neg in each batch.
+      repo_balanced=False (default): weight by 1/class_size globally.
+      repo_balanced=True           : weight by 1/(repo_size × class_size_in_repo)
+        so every repo contributes equally regardless of how many commits it has,
+        and VCC:neg is balanced within each repo. This reduces cross-repo
+        domain shift from large repos (e.g. tensorflow) dominating training.
     For val/test: sequential order, true class distribution (for unbiased metrics).
 
     Args:
-        dataset    : VulnCommitDataset instance
-        batch_size : graphs per batch (128 is safe on A100/V100)
-        num_workers: parallel file-loading workers
-        is_train   : if True, use WeightedRandomSampler; if False, sequential
-        pin_memory : pin CPU tensors for faster GPU transfer (disable on CPU-only)
+        dataset       : VulnCommitDataset instance
+        batch_size    : graphs per batch (128 is safe on A100/V100)
+        num_workers   : parallel file-loading workers
+        is_train      : if True, use WeightedRandomSampler; if False, sequential
+        pin_memory    : pin CPU tensors for faster GPU transfer
+        repo_balanced : if True, balance across repos as well as classes
     """
     if is_train:
-        n_pos, n_neg = dataset.label_counts()
-        n = n_pos + n_neg
-        # Inverse-frequency weights: each class contributes equally in expectation
-        weights = [
-            n / (2.0 * n_pos) if int(lbl) == 1 else n / (2.0 * n_neg)
-            for lbl in dataset.records["label"]
-        ]
+        rec = dataset.records
+        if repo_balanced:
+            # w_i = 1 / (n_repo_r * n_class_l_in_repo_r)
+            # Computed per (repo_url, label) group.
+            group_counts = rec.groupby(["repo_url", "label"]).size().to_dict()
+            repo_counts  = rec["repo_url"].map(rec.groupby("repo_url").size()).to_numpy()
+            weights = [
+                1.0 / (repo_counts[i] * max(group_counts.get((rec["repo_url"].iloc[i], int(rec["label"].iloc[i])), 1), 1))
+                for i in range(len(rec))
+            ]
+        else:
+            n_pos, n_neg = dataset.label_counts()
+            n = n_pos + n_neg
+            # Inverse-frequency weights: each class contributes equally in expectation
+            weights = [
+                n / (2.0 * n_pos) if int(lbl) == 1 else n / (2.0 * n_neg)
+                for lbl in rec["label"]
+            ]
         sampler = WeightedRandomSampler(
             weights=weights,
-            num_samples=n,
+            num_samples=len(rec),
             replacement=True,
         )
         return DataLoader(
