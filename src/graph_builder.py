@@ -42,18 +42,46 @@ FILE_CODE_FEAT_COLS = [
 FUNC_FEAT_COLS = [
     "num_lines_of_code", "complexity", "token_count", "length", "top_nesting_level",
 ]
+# Developer node features — point-in-time (v2 pipeline).
+# v1 used global lifetime totals (total_commits, active_weeks, …) which leaked
+# future information.  v2 replaces them with tenure + commit count at commit time.
 DEV_FEAT_COLS = [
-    "total_commits", "active_weeks", "total_issues", "total_pull_requests",
+    "dev_experience_days", "dev_commits_before", "dev_is_new_contributor",
 ]
-# Engineered commit-level features for SDLC nodes (mode 2/3)
-ENGINEERED_ISSUE_FEATS  = ["issue_open_30d", "issue_open_90d", "issue_open_180d", "issue_age_median", "issue_close_rate_180d"]
-ENGINEERED_PR_FEATS     = ["pr_count_30d", "pr_count_90d", "pr_count_180d", "pr_age_median", "pr_merge_or_close_rate_180d"]
-ENGINEERED_TAG_FEATS    = ["days_since_prev_tag", "tags_last_180d"]
+
+# Engineered commit-level features for SDLC nodes (mode 2/3).
+# ALL features are strictly backward-looking (≤ anchor_dt).
+# REMOVED vs old code:
+#   issue_close_rate_180d        — denominator used anc+180d (future)
+#   pr_merge_or_close_rate_180d  — same
+#   release_cycle_position       — required next tag after commit
+ENGINEERED_ISSUE_FEATS  = [
+    "issue_open_30d", "issue_open_90d", "issue_open_180d",
+    "issue_age_median",
+    "issues_closed_last_90d", "issues_closed_last_180d",
+    "issue_open_velocity_30d", "issue_open_velocity_90d",
+]
+ENGINEERED_PR_FEATS     = [
+    "pr_count_30d", "pr_count_90d", "pr_count_180d",
+    "pr_age_median",
+    "pr_closed_last_90d", "pr_closed_last_180d",
+    "pr_open_velocity_30d", "pr_open_velocity_90d",
+]
+ENGINEERED_TAG_FEATS    = [
+    "days_since_prev_tag", "tags_last_180d", "tags_last_365d",
+    "avg_release_cadence_days", "days_since_prev_tag_norm",
+]
 ENGINEERED_C2I_EDGE     = ["issue_open_90d"]
 ENGINEERED_C2PR_EDGE    = ["pr_count_90d"]
-ENGINEERED_C2TAG_EDGE   = ["release_cycle_position"]
+# release_cycle_position removed (used future tag). Replaced with past-only norm.
+ENGINEERED_C2TAG_EDGE   = ["days_since_prev_tag_norm"]
 ENGINEERED_I2PR_EDGE    = ["pr_to_issue_open_ratio_90d", "has_issue_pr_gap"]
 ENGINEERED_TAG2X_EDGE   = ["activity_since_last_tag"]
+
+# Repo-level process features (new in v2, backward-safe)
+ENGINEERED_REPO_FEATS   = [
+    "repo_commits_last_30d", "repo_commits_last_90d", "repo_active_authors_90d",
+]
 
 CHANGE_TYPE_CATS = ["ADD", "MODIFY", "DELETE", "RENAME", "COPY", "UNKNOWN"]
 CHANGE_TYPE_MAP  = {ct: i for i, ct in enumerate(CHANGE_TYPE_CATS)}
@@ -61,16 +89,23 @@ CHANGE_TYPE_MAP  = {ct: i for i, ct in enumerate(CHANGE_TYPE_CATS)}
 FUNC_CHANGE_TYPE_CATS = ["MODIFY", "ADD", "DELETE", "RENAME", "REFACTOR"]
 FUNC_CHANGE_TYPE_MAP  = {ct: i for i, ct in enumerate(FUNC_CHANGE_TYPE_CATS)}
 
-# Engineered features that are counts / durations and need log1p normalisation.
-# Rate features (0-1) and binary flags are left as-is.
+# Columns that are raw counts / durations → apply log1p before feeding to GNN.
+# Rate features (0-1), binary flags, and already-normalised features are left as-is.
 SDLC_LOG1P_COLS = {
     "issue_open_30d", "issue_open_90d", "issue_open_180d",
     "issue_age_median",
+    "issues_closed_last_90d", "issues_closed_last_180d",
+    "issue_open_velocity_30d", "issue_open_velocity_90d",
     "pr_count_30d", "pr_count_90d", "pr_count_180d",
     "pr_age_median",
-    "days_since_prev_tag", "days_to_next_tag",
-    "tags_last_180d",
+    "pr_closed_last_90d", "pr_closed_last_180d",
+    "pr_open_velocity_30d", "pr_open_velocity_90d",
+    "days_since_prev_tag",
+    "avg_release_cadence_days",
+    "tags_last_180d", "tags_last_365d",
     "activity_since_last_tag",
+    "dev_experience_days", "dev_commits_before",
+    "repo_commits_last_30d", "repo_commits_last_90d", "repo_active_authors_90d",
 }
 
 
@@ -184,6 +219,7 @@ def build_graph(
             tables.get("commit_author"),
             ownership_window_days, ownership_threshold,
             commit_row=commit_row,
+            commit_features_row=commit_features_row,
         )
 
     if include_issues:
@@ -312,9 +348,16 @@ def add_developer_nodes(
     ownership_window_days: int = 90,
     ownership_threshold: float = OWNERSHIP_THRESHOLD,
     commit_row: Optional[pd.DataFrame] = None,
+    commit_features_row: Optional[pd.DataFrame] = None,
 ) -> None:
     """
-    developer nodes — 4 features (log1p normalised).
+    developer nodes — 3 features (log1p for counts, as-is for binary).
+    DEV_FEAT_COLS = [dev_experience_days, dev_commits_before, dev_is_new_contributor]
+
+    v2: features are point-in-time (at commit anchor), loaded from commit_features_row.
+    All developer nodes in a commit share the same author-level experience features
+    (most commits have a single author; multi-author commits use the same values).
+
     Inclusion rule: ownership_ratio >= threshold OR commit author (Bird et al. 2011).
     Stores email_to_dev_idx on data for use by add_developer_edges().
     """
@@ -334,14 +377,30 @@ def add_developer_nodes(
     n_devs    = len(all_dev_emails)
     dev_feats = np.zeros((n_devs, len(DEV_FEAT_COLS)), dtype=np.float32)
 
-    if developer_info is not None and n_devs > 0:
-        di = developer_info.copy()
-        di["_email"] = di["dev_id"].str.strip().str.lower()
-        di = di.set_index("_email")
-        for email, idx in email_to_dev_idx.items():
-            if email in di.index:
-                vals = di.loc[email, DEV_FEAT_COLS].fillna(0).values.astype("float64")
-                dev_feats[idx] = np.log1p(vals)
+    # v2 path: point-in-time features from commit_features_row (preferred)
+    cfr = commit_features_row if (commit_features_row is not None and
+                                   not commit_features_row.empty) else pd.DataFrame()
+    v2_cols_present = (not cfr.empty and
+                       all(c in cfr.columns for c in DEV_FEAT_COLS))
+
+    if n_devs > 0:
+        if v2_cols_present:
+            # Same point-in-time features for every developer node in this commit
+            vals = cfr[DEV_FEAT_COLS].fillna(0).values[0].astype("float64")
+            for col_i, col in enumerate(DEV_FEAT_COLS):
+                if col in SDLC_LOG1P_COLS:
+                    vals[col_i] = np.log1p(vals[col_i])
+            dev_feats[:] = vals.astype("float32")
+        elif developer_info is not None:
+            # v1 fallback: global lifetime stats from developer_info by email
+            di = developer_info.copy()
+            di["_email"] = di["dev_id"].str.strip().str.lower()
+            di = di.set_index("_email")
+            legacy_cols = [c for c in DEV_FEAT_COLS if c in di.columns]
+            for email, idx in email_to_dev_idx.items():
+                if email in di.index and legacy_cols:
+                    raw = di.loc[email, legacy_cols].fillna(0).values.astype("float64")
+                    dev_feats[idx, :len(legacy_cols)] = np.log1p(raw)
 
     data["developer"].x = torch.tensor(dev_feats, dtype=torch.float32)
     # Stash for edge builder (avoids recomputing)
@@ -417,25 +476,18 @@ def add_tag_nodes(
     TAG_FEAT_KEYS = ["major", "minor", "patch", "is_prerelease", "is_hotfix", "is_major_bump", "days_distance"]
 
     if mode == 4:
+        # Only the previous tag node — next_tag used future data and was removed.
         rows = []
         if not commit_features_row.empty:
             cfr = commit_features_row.iloc[0]
             prev_name = cfr.get("prev_tag_name", None)
-            next_name = cfr.get("next_tag_name", None)
             prev_days = cfr.get("days_since_prev_tag", None)
-            next_days = cfr.get("days_to_next_tag", None)
             prev_parsed = parse_tag_features(
                 prev_name,
                 -float(prev_days) if pd.notna(prev_days) else 0.0,  # negative = before
             )
-            next_parsed = parse_tag_features(
-                next_name,
-                float(next_days) if pd.notna(next_days) else 0.0,   # positive = after
-            )
             if prev_parsed is not None:
                 rows.append([prev_parsed[k] for k in TAG_FEAT_KEYS])
-            if next_parsed is not None:
-                rows.append([next_parsed[k] for k in TAG_FEAT_KEYS])
         if rows:
             data["release_tag"].x = torch.tensor(np.array(rows, dtype="float32"), dtype=torch.float32)
         else:
@@ -1127,26 +1179,29 @@ def load_all_tables(
     _load(os.path.join(g, "ownership_window.csv"), "ownership_window")
 
     # ── developer / author ────────────────────────────────────────────────────
+    # developer_info: used only for fallback identity; point-in-time features
+    # come from commit_dev_features_v2 (joined into commit_features table).
     dev_primary  = os.path.join(p, "data/processed/developer_info_commits.csv")
-    dev_fallback = os.path.join(g, "developer_info_clean.csv")
+    dev_fallback = os.path.join(p, "ICVul_pp/data_new/developer_info_clean.csv")
     _load(dev_primary if os.path.exists(dev_primary) else dev_fallback, "developer_info")
 
     ca_primary  = os.path.join(p, "data/processed/commit_author.csv")
-    ca_fallback = os.path.join(g, "commit_author_clean.csv")
+    ca_fallback = os.path.join(p, "ICVul_pp/data_new/commit_author_clean.csv")
     _load(ca_primary if os.path.exists(ca_primary) else ca_fallback, "commit_author")
 
-    _load(os.path.join(p, "data/sdlc_features/final_commit_level_features.csv"), "commit_features")
+    # v2: leakage-free engineered features (no future data)
+    _load(os.path.join(p, "ICVul_pp/data_new/final_commit_level_features_v2.csv"), "commit_features")
     # Large SDLC tables: drop text columns never used as GNN features, and
     # pre-filter to requested commits when commit_hashes is provided.
     # issue_info: drop opened_by_dev_id (identifier, unused), labels (text, unused)
     # pr_info:    drop pr_url, title, opened_by_dev_id, closed_by_dev_id (all unused)
-    _load_sdlc(os.path.join(p, "data/sdlc_filtered/issue_info_v4.csv"),
+    _load_sdlc(os.path.join(p, "ICVul_pp/data_new/issue_info_v4.csv"),
                "issue_info",
                drop_cols=["opened_by_dev_id", "labels"])
-    _load_sdlc(os.path.join(p, "data/sdlc_filtered/pull_request_info_v4.csv"),
+    _load_sdlc(os.path.join(p, "ICVul_pp/data_new/pull_request_info_v4.csv"),
                "pr_info",
                drop_cols=["pr_url", "title", "opened_by_dev_id", "closed_by_dev_id"])
-    _load_sdlc(os.path.join(p, "data/sdlc_filtered/release_tag_info_v4.csv"),
+    _load_sdlc(os.path.join(p, "ICVul_pp/data_new/release_tag_info_v4.csv"),
                "release_tag_info")
     _load(os.path.join(p, "data/processed/cve_fc_vcc_mapping.csv"),              "vcc_fc_mapping")
 
@@ -1598,10 +1653,14 @@ def build_multi_commit_graph(
         di = developer_info.copy()
         di["_email"] = di["dev_id"].str.strip().str.lower()
         di = di.set_index("_email")
-        for email, idx in global_email_to_idx.items():
-            if email in di.index:
-                vals = di.loc[email, DEV_FEAT_COLS].fillna(0).values.astype("float64")
-                dev_feats[idx] = np.log1p(vals)
+        # Use only columns that exist in developer_info (v2 cols live in commit_features)
+        avail_cols = [c for c in DEV_FEAT_COLS if c in di.columns]
+        if avail_cols:
+            col_idx = [DEV_FEAT_COLS.index(c) for c in avail_cols]
+            for email, idx in global_email_to_idx.items():
+                if email in di.index:
+                    vals = di.loc[email, avail_cols].fillna(0).values.astype("float64")
+                    dev_feats[idx, col_idx] = np.log1p(vals)
 
     # ── Step 4: merge HeteroData — snapshot node features ────────────────────
     data = HeteroData()
