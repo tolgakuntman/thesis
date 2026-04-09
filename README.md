@@ -1,274 +1,184 @@
-# Information about the train and test datasets:
-- Random split sizes: 6952 1738
-- Temporal split sizes: 6952 1738
-- Class distribution in temporal test set:
-    - 0:    0.602417
-    - 1:    0.397583
-- Class distribution in temporal train set:
-    - 1:    0.739499
-    - 0:    0.260501
-- Class distribution in random train set:
-    - 1:    0.671174
-    - 0:    0.328826
-- Class distribution in random test set:
-    - 1:    0.670886
-    - 0:    0.329114
-- Correlation between the label and each feature:
-    - label                  1.000000
-    - log_churn              0.522567
-    - dmm_unit_size          0.132024
-    - dmm_unit_complexity    0.109827
-    - hour_cos               0.092922
-    - msg_len                0.010839
-    - weekday_sin           -0.011977
-    - weekday_cos           -0.023410
-    - hour_sin              -0.029680
-    - time_diff             -0.095136
-    - has_fix_word          -0.394903
-# Logistic Regression:
-## Logistic Regression — Random split (Test results)
+# GNN-Based Commit-Level VCC Detector
 
-### Summary metrics
-| Metric | Value |
-|---|---:|
-| ROC-AUC | 0.8832 |
-| PR-AUC (AP) | 0.9414 |
-| MCC | 0.5892 |
-| Cohen's κ | 0.5785 |
-| Accuracy | 0.8009 |
+Binary classifier that predicts whether a commit is a Vulnerability Contributing Commit (VCC) using a heterogeneous GNN over per-commit ego-graphs.
 
-### Classification report (Test, threshold = 0.5)
-| Class | Precision | Recall | F1-score | Support |
-|---:|---:|---:|---:|---:|
-| 0 | 0.6552 | 0.8339 | 0.7338 | 572 |
-| 1 | 0.9059 | 0.7847 | 0.8410 | 1166 |
-| accuracy |  |  | 0.8009 | 1738 |
-| macro avg | 0.7806 | 0.8093 | 0.7874 | 1738 |
-| weighted avg | 0.8234 | 0.8009 | 0.8057 | 1738 |
+**Label definition:** VCC = 1, FC and normal commits = 0. This is vulnerability detection, not fix discrimination.
 
-![alt text](img/image.png)
+---
 
-![alt text](img/image-1.png)
+## Environment
 
-## Logistic Regression — Temporal split (Test results)
+```bash
+conda activate thesis
+```
 
-**ROC-AUC:** 0.8296 • **PR-AUC (AP):** 0.8057 • **MCC:** 0.5088 • **Cohen's κ:** 0.5086
+---
 
-### Summary metrics
-| Metric | Value |
-|---|---:|
-| Threshold (t) | 0.500 |
-| ROC-AUC | 0.8296 |
-| PR-AUC (AP) | 0.8057 |
-| MCC | 0.5088 |
-| Cohen's κ | 0.5086 |
-| Accuracy | 0.7635 |
+## Pipeline Overview
 
-### Classification report (Test, threshold = 0.500)
-| Class | Precision | Recall | F1-score | Support |
-|---:|---:|---:|---:|---:|
-| 0 | 0.8093 | 0.7947 | 0.8019 | 1047 |
-| 1 | 0.6972 | 0.7164 | 0.7066 | 691 |
-| accuracy |  |  | 0.7635 | 1738 |
-| macro avg | 0.7533 | 0.7555 | 0.7543 | 1738 |
-| weighted avg | 0.7647 | 0.7635 | 0.7640 | 1738 |
+```
+ICVul++ extraction
+      ↓
+final_graph_inputs_v1/   ← normalized CSVs + embeddings
+      ↓
+build_graphs_final.py    ← builds one .pt HeteroData per commit
+      ↓
+create_split_index_final.py  ← repo-level train/val/test split
+      ↓
+compute_perrepo_scaler.py    ← per-repo normalization stats (train only)
+      ↓
+train.py                 ← trains HeteroSAGE or HeteroRGCN
+      ↓
+test eval (auto at end of train.py using best.pt)
+```
 
-![alt text](img/image-3.png)
+---
 
-![alt text](img/image-2.png)
+## Step 1 — Build Graphs
 
-## LR tuned (Temporal split) — Test — metrics @ t=0.213
+Reads from `data_new/analysis_outputs/final_graph_inputs_v1/` and writes one `.pt` file per commit to `outputs/final_graph_ready/graphs/`.
 
-**ROC-AUC:** 0.8297 • **PR-AUC (AP):** 0.8058 • **MCC:** 0.3462 • **Cohen's κ:** 0.2848
+```bash
+python scripts/build_graphs_final.py
+python scripts/build_graphs_final.py --limit 100   # smoke test
+```
 
-### Summary metrics
-| Metric | Value |
-|---|---:|
-| Threshold (t) | 0.213 |
-| ROC-AUC | 0.8297 |
-| PR-AUC (AP) | 0.8058 |
-| MCC | 0.3462 |
-| Cohen's κ | 0.2848 |
-| Accuracy | 0.6122 |
+Each graph is a `HeteroData` object with node types: `commit`, `file`, `function`, `hunk`, `developer`, `issue`, `pull_request`, `release_tag`.
 
-### Classification report (Test, threshold = 0.213)
-| Class | Precision | Recall | F1-score | Support |
-|---:|---:|---:|---:|---:|
-| 0 | 0.8650 | 0.4222 | 0.5674 | 1047 |
-| 1 | 0.5069 | 0.9001 | 0.6486 | 691 |
-| accuracy |  |  | 0.6122 | 1738 |
-| macro avg | 0.6859 | 0.6612 | 0.6080 | 1738 |
-| weighted avg | 0.7226 | 0.6122 | 0.5997 | 1738 |
+**Important:** never rebuild graphs over the matched-normals benchmark without updating the input path. The builder reads from a hardcoded `FINAL` path — override it explicitly if using a new benchmark package.
 
-## p-values for logistic regression
-- Significant (p<0.05):
-    - const           3.880706e-310
-    - log_churn       5.667398e-237
-    - has_fix_word     1.542403e-72
-    - time_diff        1.616709e-19
-    - hour_cos         1.047175e-03
-    - msg_len          4.030560e-03
-    - weekday_sin      4.490449e-02
-    - weekday_cos      4.588335e-02
+---
 
-# Decision tree
+## Step 2 — Create Split Index
 
+Assigns each built commit to train/val/test at the **repo level** (no commit from a held-out repo appears in train).
 
-## Decision Tree (Random split) — Test — metrics @ t=0.500
+```bash
+python scripts/create_split_index_final.py
+```
 
-**ROC-AUC:** 0.8599 • **PR-AUC (AP):** 0.9117 • **MCC:** 0.5577 • **Cohen's κ:** 0.5462
+Output: `outputs/final_graph_ready/split_index.csv` with columns `hash, label, repo_url, repo_split`.
 
-### Summary metrics
-| Metric | Value |
-|---|---:|
-| Threshold (t) | 0.500 |
-| ROC-AUC | 0.8599 |
-| PR-AUC (AP) | 0.9117 |
-| MCC | 0.5577 |
-| Cohen's κ | 0.5462 |
-| Accuracy | 0.7848 |
+**Val repos (5):** ImageMagick, radare2, tcpdump, php-src, FreeRDP  
+**Test repos (6):** FFmpeg, gpac, suricata, openssl, redis, envoy  
+**Train:** everything else (including tensorflow)
 
-### Classification report (Test, threshold = 0.500)
-| Class | Precision | Recall | F1-score | Support |
-|---:|---:|---:|---:|---:|
-| 0 | 0.6341 | 0.8182 | 0.7145 | 572 |
-| 1 | 0.8960 | 0.7684 | 0.8273 | 1166 |
-| accuracy |  |  | 0.7848 | 1738 |
-| macro avg | 0.7651 | 0.7933 | 0.7709 | 1738 |
-| weighted avg | 0.8098 | 0.7848 | 0.7902 | 1738 |
+Do not use `temporal_split` for thesis results — VCC/FC pairs cross the train/test boundary.
 
-![alt text](img/image-4.png)
+---
 
-![alt text](img/image-5.png)
+## Step 3 — Per-Repo Scaler
 
-## Decision Tree (Temporal split) — Test — metrics @ t=0.500
+Computes per-repo mean/std for continuous numeric features from **training graphs only**. Val/test repos are excluded to prevent data leakage into normalization statistics.
 
-**ROC-AUC:** 0.7799 • **PR-AUC (AP):** 0.6834 • **MCC:** 0.4047 • **Cohen's κ:** 0.3987
+```bash
+python scripts/compute_perrepo_scaler.py
+```
 
-### Summary metrics
-| Metric | Value |
-|---|---:|
-| Threshold (t) | 0.500 |
-| ROC-AUC | 0.7799 |
-| PR-AUC (AP) | 0.6834 |
-| MCC | 0.4047 |
-| Cohen's κ | 0.3987 |
-| Accuracy | 0.7014 |
+Output: `outputs/final_graph_ready/perrepo_function_scaler.json`
 
-### Classification report (Test, threshold = 0.500)
-| Class | Precision | Recall | F1-score | Support |
-|---:|---:|---:|---:|---:|
-| 0 | 0.7940 | 0.6810 | 0.7332 | 1047 |
-| 1 | 0.6024 | 0.7323 | 0.6610 | 691 |
-| accuracy |  |  | 0.7014 | 1738 |
-| macro avg | 0.6982 | 0.7066 | 0.6971 | 1738 |
-| weighted avg | 0.7178 | 0.7014 | 0.7045 | 1738 |
+Must be rerun whenever the training set changes (e.g. new benchmark family).
 
-![alt text](img/image-6.png)
+---
 
-![alt text](img/image-7.png)
+## Step 4 — Train
 
-## Decision Tree tuned (Temporal split) — Test — metrics @ t=0.500
+```bash
+# Primary model (HeteroSAGE, repo split)
+python scripts/train.py --run_name sage_matched_v1 --perrepo_norm
 
-**ROC-AUC:** 0.8255 • **PR-AUC (AP):** 0.7793 • **MCC:** 0.5099 • **Cohen's κ:** 0.5099
+# Ablation: no code/file size metrics
+python scripts/train.py --run_name sage_nosize_v1 --perrepo_norm \
+    --ablate_fn_code_metrics --ablate_file_code_metrics
 
-### Summary metrics
-| Metric | Value |
-|---|---:|
-| Threshold (t) | 0.500 |
-| ROC-AUC | 0.8255 |
-| PR-AUC (AP) | 0.7793 |
-| MCC | 0.5099 |
-| Cohen's κ | 0.5099 |
-| Accuracy | 0.7652 |
+# Override paths for a new benchmark family
+python scripts/train.py \
+    --graphs_dir data_new/analysis_outputs/matched_normals_v1/graphs \
+    --split_index data_new/analysis_outputs/matched_normals_v1/split_index.csv \
+    --run_name sage_matched_v1 --perrepo_norm
+```
 
-### Classification report (Test, threshold = 0.500)
-| Class | Precision | Recall | F1-score | Support |
-|---:|---:|---:|---:|---:|
-| 0 | 0.8052 | 0.8052 | 0.8052 | 1047 |
-| 1 | 0.7048 | 0.7048 | 0.7048 | 691 |
-| accuracy |  |  | 0.7652 | 1738 |
-| macro avg | 0.7550 | 0.7550 | 0.7550 | 1738 |
-| weighted avg | 0.7652 | 0.7652 | 0.7652 | 1738 |
+Key defaults: `--hidden 128 --dropout 0.3 --lr 1e-3 --epochs 100 --batch_size 128 --patience 15`
 
-![alt text](img/image-8.png)
+**Checkpoints** are saved to `outputs/runs/<run_name>/`:
+- `best.pt` — highest val AUC-PR (used for test eval)
+- `latest.pt` — resumed after preemption
+- `metrics.csv` — per-epoch train/val metrics
 
-## Feature importance:
+Test evaluation runs automatically at the end using `best.pt`.
 
-![alt text](img/image-9.png)
+**Primary metric:** AUC-PR (threshold-free, imbalance-aware). Secondary: MCC, F1.
 
-![alt text](img/image-10.png)
+---
 
-## Hyper-parameter tunning:
+## Step 5 — Ablation Matrix
 
-![alt text](img/image-11.png)
+All ablations use `--ablate_fn_code_metrics --ablate_file_code_metrics` (no size features) as the baseline regime.
 
-![alt text](img/image-12.png)
+| Run | Extra flags |
+|---|---|
+| Baseline (no size) | *(none beyond base)* |
+| No code embedding | `--ablate_code_emb` |
+| No message embedding | `--ablate_msg_emb` |
+| No SDLC | `--ablate_sdlc` |
+| No fct flags | `--ablate_fn_categorical` |
+| No embeddings | `--ablate_code_emb --ablate_msg_emb` |
 
-![alt text](img/image-13.png)
+---
 
-# Random Forest
+## Benchmark Families
 
-**All random forest values are chosen based on Gridsearch tunning method**
+| Family | Location | Notes |
+|---|---|---|
+| `final_graph_ready` | `outputs/final_graph_ready/` | Original stratified normal sample (31,513 normals). Do not use for main thesis results. |
+| `matched_normals_v1` | `outputs/final_graph_ready_matched_normals_v1/` | Complexity-matched normals (cap×20). **Primary thesis benchmark.** |
 
-**Number of estimators:** 200 • **min samples per leaf:** 8 • **min samples before split:** 20
+Do not compare numbers across benchmark families without explicitly labeling them as cross-benchmark.
 
-## Random Forest (Temporal split) — Test — metrics @ t=0.500
+---
 
-**ROC-AUC:** 0.8346 • **PR-AUC (AP):** 0.7985 • **MCC:** 0.5027 • **Cohen's κ:** 0.4984
+## Repository Structure
 
-### Summary metrics
-| Metric | Value |
-|---|---:|
-| Threshold (t) | 0.500 |
-| ROC-AUC | 0.8346 |
-| PR-AUC (AP) | 0.7985 |
-| MCC | 0.5027 |
-| Cohen's κ | 0.4984 |
-| Accuracy | 0.7532 |
+```
+src/
+  graph_builder.py       # Core graph construction (legacy — see build_graphs_final.py)
+  graph_dataset.py       # PyG Dataset, make_loader(), perrepo_norm, ablation flags
+  model.py               # HeteroSAGE (primary), HeteroRGCN (ablation), FocalLoss
+  data_structure.py      # Column definitions for CSV tables
+scripts/
+  build_graphs_final.py        # Graph builder for final_graph_inputs_v1 package
+  create_split_index_final.py  # Repo-level split index
+  compute_perrepo_scaler.py    # Per-repo normalization stats
+  sample_matched_normals.py    # Matched-normal sampling (produces benchmark_manifest.csv)
+  train.py                     # Training loop
+  validate_graphs.py           # Sanity checks on built graphs
+  *.slurm                      # VSC/HPC job scripts
+docs/
+  GRAPH_CONSTRUCTION.md        # Graph schema, node/edge types, feature dims
+  DATA_README.md               # Full CSV schema reference
+env/
+  thesis.yml                   # Conda environment spec
+notebooks/                     # Exploratory notebooks (not part of pipeline)
+```
 
-### Classification report (Test, threshold = 0.500)
-| Class | Precision | Recall | F1-score | Support |
-|---:|---:|---:|---:|---:|
-| 0 | 0.8301 | 0.7421 | 0.7837 | 1047 |
-| 1 | 0.6633 | 0.7699 | 0.7127 | 691 |
-| accuracy |  |  | 0.7532 | 1738 |
-| macro avg | 0.7467 | 0.7560 | 0.7482 | 1738 |
-| weighted avg | 0.7638 | 0.7532 | 0.7554 | 1738 |
+---
 
-![alt text](img/image-14.png)
+## What Goes in Git
 
-![alt text](img/image-15.png)
+**Include:**
+- `src/` — all model and dataset code
+- `scripts/` — all pipeline scripts and SLURM files
+- `docs/` — schema documentation
+- `env/thesis.yml` — environment spec
+- `CLAUDE.md`, `AGENTS.md`, `README.md`
+- `notebooks/` — if they contain reproducible analysis
 
-## Random Forest (Random split) — Test — metrics @ t=0.500
+**Exclude (add to `.gitignore`):**
+- `data/`, `data_new/` — all CSV tables and raw data (too large, not reproducible from this repo)
+- `outputs/` — built graphs (`.pt`), checkpoints, metrics (reproducible from scripts)
+- `*.npy` — embedding arrays
+- `*.json` scaler files (reproducible from `compute_perrepo_scaler.py`)
+- `__pycache__/`, `.ipynb_checkpoints/`
+- `.claude/` — agent memory and worktrees (local tooling, not thesis code)
 
-**ROC-AUC:** 0.8960 • **PR-AUC (AP):** 0.9467 • **MCC:** 0.6202 • **Cohen's κ:** 0.6146
-
-### Summary metrics
-| Metric | Value |
-|---|---:|
-| Threshold (t) | 0.500 |
-| ROC-AUC | 0.8960 |
-| PR-AUC (AP) | 0.9467 |
-| MCC | 0.6202 |
-| Cohen's κ | 0.6146 |
-| Accuracy | 0.8216 |
-
-### Classification report (Test, threshold = 0.500)
-| Class | Precision | Recall | F1-score | Support |
-|---:|---:|---:|---:|---:|
-| 0 | 0.6926 | 0.8234 | 0.7524 | 572 |
-| 1 | 0.9045 | 0.8208 | 0.8606 | 1166 |
-| accuracy |  |  | 0.8216 | 1738 |
-| macro avg | 0.7986 | 0.8221 | 0.8065 | 1738 |
-| weighted avg | 0.8348 | 0.8216 | 0.8250 | 1738 |
-
-![alt text](img/image-16.png)
-
-![alt text](img/image-17.png)
-
-## Feature importance:
-
-![alt text](img/image-18.png)
-
-![alt text](img/image-19.png)
+The repo should be runnable given: (1) the conda env, (2) the `final_graph_inputs_v1/` package provided separately (e.g. as a data release or shared drive link).
