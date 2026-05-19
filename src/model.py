@@ -27,13 +27,21 @@ Edge types (all bidirectional):
     commit ↔ issue          (has_issue / linked_to_commit)
     commit ↔ pull_request   (has_pr / linked_to_commit)
     commit ↔ release_tag    (has_release / release_of)
+
+Structural exclusion:
+    Pass exclude_node_types and/or exclude_edge_rels to model constructors to
+    physically remove node types and edge relations from the message-passing graph.
+    'commit' cannot be excluded (assertion). Edges whose src or dst node type is
+    excluded are automatically dropped. Edge relations listed in exclude_edge_rels
+    are dropped regardless of node availability.
 """
 
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
 from torch.nn.parameter import UninitializedParameter
-from torch_geometric.nn import GATv2Conv, HeteroConv, SAGEConv, RGCNConv
+from torch_geometric.nn import GATv2Conv, HeteroConv, SAGEConv
+from torch_geometric.nn.conv import MessagePassing
 
 # ── constants ─────────────────────────────────────────────────────────────────
 
@@ -91,9 +99,42 @@ EDGE_ATTR_DIMS: dict[tuple[str, str, str], int] = {
 }
 
 
-def build_relation_convs(hidden: int) -> dict[tuple[str, str, str], nn.Module]:
+def _resolve_active_types(
+    exclude_node_types: list[str] | tuple[str, ...],
+    exclude_edge_rels: list[str] | tuple[str, ...],
+) -> tuple[list[str], list[tuple[str, str, str]]]:
+    """
+    Compute the active node types and edge types given exclusion lists.
+
+    Rules:
+      - 'commit' cannot be excluded.
+      - Edge types are dropped if their src or dst node type is excluded,
+        OR if their relation name is in exclude_edge_rels.
+    """
+    excl_nodes = set(exclude_node_types)
+    excl_rels  = set(exclude_edge_rels)
+    assert "commit" not in excl_nodes, "'commit' node type cannot be excluded"
+
+    active_nodes = [nt for nt in NODE_TYPES if nt not in excl_nodes]
+    active_nodes_set = set(active_nodes)
+    active_edges = [
+        et for et in EDGE_TYPES
+        if et[0] in active_nodes_set
+        and et[2] in active_nodes_set
+        and et[1] not in excl_rels
+    ]
+    return active_nodes, active_edges
+
+
+def build_relation_convs(
+    hidden: int,
+    edge_types: list[tuple[str, str, str]] | None = None,
+) -> dict[tuple[str, str, str], nn.Module]:
+    """Build per-relation conv modules. Pass edge_types=None to use all EDGE_TYPES."""
+    if edge_types is None:
+        edge_types = EDGE_TYPES
     convs: dict[tuple[str, str, str], nn.Module] = {}
-    for et in EDGE_TYPES:
+    for et in edge_types:
         edge_dim = EDGE_ATTR_DIMS.get(et)
         if edge_dim is not None:
             convs[et] = GATv2Conv(
@@ -166,29 +207,52 @@ class HeteroSAGE(nn.Module):
            — each graph has exactly 1 commit node, so after batching
              h['commit'] has shape [batch_size, hidden]
 
+    Structural exclusion:
+        exclude_node_types : node types to physically remove from the graph.
+                             Their projections and LayerNorms are not built.
+                             Edges touching excluded types are also removed.
+        exclude_edge_rels  : relation names (middle element of edge triple)
+                             to exclude, even if src/dst nodes are active.
+
     Args:
-        hidden  : hidden dimension (default 128)
-        dropout : dropout probability (default 0.3)
+        hidden             : hidden dimension (default 128)
+        dropout            : dropout probability (default 0.3)
+        feat_dropout       : input feature dropout (default 0.0 = off)
+        exclude_node_types : node types to structurally remove (default: none)
+        exclude_edge_rels  : edge relations to structurally remove (default: none)
     """
 
-    def __init__(self, hidden: int = 128, dropout: float = 0.3):
+    def __init__(
+        self,
+        hidden: int = 128,
+        dropout: float = 0.3,
+        feat_dropout: float = 0.0,
+        exclude_node_types: list[str] | tuple[str, ...] = (),
+        exclude_edge_rels:  list[str] | tuple[str, ...] = (),
+    ):
         super().__init__()
         self.hidden  = hidden
         self.dropout_p = dropout
+        self.feat_dropout_p = feat_dropout
 
-        # Lazy projections let the same model consume both legacy and final-package
-        # graphs without hard-coding input dimensions per node type.
+        self._active_node_types, self._active_edge_types = _resolve_active_types(
+            exclude_node_types, exclude_edge_rels
+        )
+        self._active_node_set = set(self._active_node_types)
+        self._active_edge_set = set(self._active_edge_types)
+
+        # Lazy projections only for active node types
         self.input_proj = nn.ModuleDict({
-            nt: nn.LazyLinear(hidden) for nt in NODE_TYPES
+            nt: nn.LazyLinear(hidden) for nt in self._active_node_types
         })
 
-        # HeteroConv layers
-        self.conv1 = HeteroConv(build_relation_convs(hidden), aggr="sum")
-        self.conv2 = HeteroConv(build_relation_convs(hidden), aggr="sum")
+        # HeteroConv layers — only active edge types
+        self.conv1 = HeteroConv(build_relation_convs(hidden, self._active_edge_types), aggr="sum")
+        self.conv2 = HeteroConv(build_relation_convs(hidden, self._active_edge_types), aggr="sum")
 
-        # LayerNorm after each conv (per node type, applied per-token → safe for any N)
-        self.ln1 = nn.ModuleDict({nt: nn.LayerNorm(hidden) for nt in NODE_TYPES})
-        self.ln2 = nn.ModuleDict({nt: nn.LayerNorm(hidden) for nt in NODE_TYPES})
+        # LayerNorm after each conv (only active node types)
+        self.ln1 = nn.ModuleDict({nt: nn.LayerNorm(hidden) for nt in self._active_node_types})
+        self.ln2 = nn.ModuleDict({nt: nn.LayerNorm(hidden) for nt in self._active_node_types})
 
         # Final classifier
         self.classifier = nn.Linear(hidden, 1)
@@ -205,14 +269,20 @@ class HeteroSAGE(nn.Module):
                     nn.init.zeros_(m.bias)
 
     def _project_inputs(self, x_dict: dict) -> dict:
-        """Project each node type to hidden dim. Returns zeros for missing/empty types."""
+        """Project each active node type to hidden dim. Inactive/missing types get empty tensor."""
         h = {}
+        device = next(self.parameters()).device
         for nt in NODE_TYPES:
-            if nt in x_dict and x_dict[nt].size(0) > 0:
-                h[nt] = F.relu(self.input_proj[nt](x_dict[nt]))
+            if nt not in self._active_node_set:
+                # Structurally excluded: empty tensor, no projection
+                h[nt] = torch.zeros(0, self.hidden, device=device, dtype=torch.float)
+            elif nt in x_dict and x_dict[nt].size(0) > 0:
+                x = x_dict[nt]
+                if self.feat_dropout_p > 0.0:
+                    x = F.dropout(x, p=self.feat_dropout_p, training=self.training)
+                h[nt] = F.relu(self.input_proj[nt](x))
             else:
-                # Placeholder empty tensor — HeteroConv skips edges to/from empty types
-                device = next(self.parameters()).device
+                # Active but absent in this graph — placeholder
                 h[nt] = torch.zeros(0, self.hidden, device=device, dtype=torch.float)
         return h
 
@@ -225,10 +295,11 @@ class HeteroSAGE(nn.Module):
         edge_attr_dict: dict | None = None,
     ) -> dict:
         """Run one HeteroConv layer, apply LayerNorm+ReLU+Dropout, preserve missing node types."""
-        # Filter edge_index_dict to only include edge types whose src/dst nodes are non-empty
+        # Filter to active edge types with non-empty src/dst
         active_edges = {
             et: ei for et, ei in edge_index_dict.items()
-            if et[0] in h and h[et[0]].size(0) > 0
+            if et in self._active_edge_set
+            and et[0] in h and h[et[0]].size(0) > 0
             and et[2] in h and h[et[2]].size(0) > 0
         }
 
@@ -238,17 +309,17 @@ class HeteroSAGE(nn.Module):
                 if et in active_edges and ea is not None and ea.numel() > 0:
                     active_edge_attr[et] = ea
 
-        out = conv(h, active_edges, edge_attr_dict=active_edge_attr)  # only updated node types returned
+        out = conv(h, active_edges, edge_attr_dict=active_edge_attr)
 
         result = {}
         for nt in NODE_TYPES:
             x_in = h[nt]
             if x_in.size(0) == 0:
-                result[nt] = x_in  # stay empty
+                result[nt] = x_in  # stay empty (excluded or absent)
             elif nt in out:
                 result[nt] = _safe_norm_act(out[nt], ln[nt], self.dropout_p, self.training)
             else:
-                # No incoming messages in this layer — keep projected input unchanged
+                # Active but received no messages — keep projected input
                 result[nt] = x_in
         return result
 
@@ -279,70 +350,166 @@ class HeteroSAGE(nn.Module):
         return logits
 
 
+# ── R-GCN basis conv ──────────────────────────────────────────────────────────
+
+class RGCNBasisConv(MessagePassing):
+    """
+    Single-relation R-GCN message-passing layer with basis decomposition.
+
+    W_r = Σ_b (coeff_b · basis_b)   (Schlichtkrull et al., ESWC 2018)
+
+    The shared `basis` parameter is owned by the parent HeteroRGCN module and
+    stored here via object.__setattr__ to avoid double-registration in the
+    nn.Module parameter tree. Each instance owns its own `coeff` vector.
+
+    Args:
+        hidden    : node feature dimension
+        num_bases : number of shared basis matrices
+    """
+
+    def __init__(self, hidden: int, num_bases: int):
+        super().__init__(aggr="mean")
+        self.hidden = hidden
+        self.coeff = nn.Parameter(torch.empty(num_bases))
+        nn.init.normal_(self.coeff, std=0.02)
+        # Basis reference set after construction — bypasses nn.Module.__setattr__
+        # so the shared tensor is not registered as a parameter of this module.
+        object.__setattr__(self, "_basis_ref", None)
+
+    def _set_basis(self, basis: torch.Tensor) -> None:
+        object.__setattr__(self, "_basis_ref", basis)
+
+    def forward(
+        self,
+        x: tuple[torch.Tensor, torch.Tensor],
+        edge_index: torch.Tensor,
+    ) -> torch.Tensor:
+        x_src, x_dst = x
+
+        if edge_index.numel() == 0 or x_src.size(0) == 0:
+            return x_dst.new_zeros(x_dst.size(0), self.hidden)
+
+        # Compute relation weight matrix W_r  →  (H, H)
+        W_r = torch.einsum("b,bhd->hd", self.coeff, self._basis_ref)
+        x_src_t = x_src @ W_r  # (N_src, H)
+
+        return self.propagate(
+            edge_index,
+            x=(x_src_t, x_dst),
+            size=(x_src.size(0), x_dst.size(0)),
+        )
+
+    def message(self, x_j: torch.Tensor) -> torch.Tensor:
+        return x_j
+
+
 # ── Ablation model: HeteroRGCN ────────────────────────────────────────────────
 
 class HeteroRGCN(nn.Module):
     """
     2-layer R-GCN ablation (Schlichtkrull et al., ESWC 2018).
 
-    Identical interface to HeteroSAGE. Uses RGCNConv with basis decomposition
-    instead of SAGEConv — transductive aggregation, no mean-pooling of neighbourhoods.
+    Identical interface to HeteroSAGE. Uses R-GCN basis decomposition instead of
+    GATv2Conv+SAGEConv — all active edge types share `num_bases` weight matrices,
+    with per-relation coefficient vectors mixing them: W_r = Σ_b(a_rb · V_b).
+
+    Edge attributes are intentionally ignored — this is the structural ablation
+    that measures how much the edge-feature convolutions in HeteroSAGE contribute.
+
+    Structural exclusion:
+        Same exclude_node_types / exclude_edge_rels interface as HeteroSAGE.
 
     Args:
-        hidden      : hidden dimension (default 128)
-        dropout     : dropout probability (default 0.3)
-        num_bases   : R-GCN basis matrices (default 3)
+        hidden             : hidden dimension (default 128)
+        dropout            : dropout probability (default 0.3)
+        num_bases          : R-GCN shared basis matrices (default 4)
+        exclude_node_types : node types to structurally remove (default: none)
+        exclude_edge_rels  : edge relations to structurally remove (default: none)
     """
 
-    def __init__(self, hidden: int = 128, dropout: float = 0.3, num_bases: int = 3):
+    def __init__(
+        self,
+        hidden: int = 128,
+        dropout: float = 0.3,
+        num_bases: int = 4,
+        exclude_node_types: list[str] | tuple[str, ...] = (),
+        exclude_edge_rels:  list[str] | tuple[str, ...] = (),
+    ):
         super().__init__()
-        raise NotImplementedError(
-            "HeteroRGCN is not currently a real R-GCN ablation in this codebase. "
-            "Use HeteroSAGE until a proper relation-specific R-GCN implementation is added."
-        )
-        self.hidden    = hidden
+        self.hidden = hidden
         self.dropout_p = dropout
-        n_rels = len(EDGE_TYPES)
+
+        self._active_node_types, self._active_edge_types = _resolve_active_types(
+            exclude_node_types, exclude_edge_rels
+        )
+        self._active_node_set = set(self._active_node_types)
+        self._active_edge_set = set(self._active_edge_types)
 
         self.input_proj = nn.ModuleDict({
-            nt: nn.LazyLinear(hidden) for nt in NODE_TYPES
+            nt: nn.LazyLinear(hidden) for nt in self._active_node_types
         })
 
-        # RGCNConv treats all relations in a flat list — we implement as HeteroConv
-        self.conv1 = HeteroConv(build_relation_convs(hidden), aggr="sum")
-        self.conv2 = HeteroConv(build_relation_convs(hidden), aggr="sum")
-        # NOTE: true R-GCN basis decomposition is applied at the relation-weight level.
-        # Full R-GCN with basis decomp across all 14 relations:
-        self._basis = nn.Parameter(torch.randn(num_bases, hidden, hidden) * 0.02)
-        self._coeff1 = nn.Parameter(torch.randn(n_rels, num_bases) * 0.02)
-        self._coeff2 = nn.Parameter(torch.randn(n_rels, num_bases) * 0.02)
+        # Shared basis parameters owned by this module — not by the individual convs.
+        # Shape: (num_bases, hidden, hidden)
+        self.basis1 = nn.Parameter(torch.empty(num_bases, hidden, hidden))
+        self.basis2 = nn.Parameter(torch.empty(num_bases, hidden, hidden))
+        nn.init.normal_(self.basis1, std=0.02)
+        nn.init.normal_(self.basis2, std=0.02)
 
-        self.ln1 = nn.ModuleDict({nt: nn.LayerNorm(hidden) for nt in NODE_TYPES})
-        self.ln2 = nn.ModuleDict({nt: nn.LayerNorm(hidden) for nt in NODE_TYPES})
+        def _make_convs(basis: nn.Parameter, edge_types: list) -> dict:
+            convs = {}
+            for et in edge_types:
+                c = RGCNBasisConv(hidden, num_bases)
+                c._set_basis(basis)
+                convs[et] = c
+            return convs
+
+        self.conv1 = HeteroConv(_make_convs(self.basis1, self._active_edge_types), aggr="sum")
+        self.conv2 = HeteroConv(_make_convs(self.basis2, self._active_edge_types), aggr="sum")
+
+        self.ln1 = nn.ModuleDict({nt: nn.LayerNorm(hidden) for nt in self._active_node_types})
+        self.ln2 = nn.ModuleDict({nt: nn.LayerNorm(hidden) for nt in self._active_node_types})
+
         self.classifier = nn.Linear(hidden, 1)
 
-    def _project_inputs(self, x_dict):
+        self._reset_parameters()
+
+    def _reset_parameters(self):
+        for m in self.modules():
+            if isinstance(m, nn.Linear):
+                if isinstance(m.weight, UninitializedParameter):
+                    continue
+                nn.init.xavier_uniform_(m.weight)
+                if m.bias is not None:
+                    nn.init.zeros_(m.bias)
+
+    def _project_inputs(self, x_dict: dict) -> dict:
         h = {}
+        device = next(self.parameters()).device
         for nt in NODE_TYPES:
-            if nt in x_dict and x_dict[nt].size(0) > 0:
+            if nt not in self._active_node_set:
+                h[nt] = torch.zeros(0, self.hidden, device=device, dtype=torch.float)
+            elif nt in x_dict and x_dict[nt].size(0) > 0:
                 h[nt] = F.relu(self.input_proj[nt](x_dict[nt]))
             else:
-                device = next(self.parameters()).device
                 h[nt] = torch.zeros(0, self.hidden, device=device, dtype=torch.float)
         return h
 
-    def _conv_and_norm(self, h, conv, ln, edge_index_dict, edge_attr_dict=None):
+    def _conv_and_norm(
+        self,
+        h: dict,
+        conv: HeteroConv,
+        ln: nn.ModuleDict,
+        edge_index_dict: dict,
+    ) -> dict:
+        """Run one HeteroConv layer (no edge attrs), apply LayerNorm+ReLU+Dropout."""
         active_edges = {
             et: ei for et, ei in edge_index_dict.items()
-            if et[0] in h and h[et[0]].size(0) > 0
+            if et in self._active_edge_set
+            and et[0] in h and h[et[0]].size(0) > 0
             and et[2] in h and h[et[2]].size(0) > 0
         }
-        active_edge_attr = {}
-        if edge_attr_dict:
-            for et, ea in edge_attr_dict.items():
-                if et in active_edges and ea is not None and ea.numel() > 0:
-                    active_edge_attr[et] = ea
-        out = conv(h, active_edges, edge_attr_dict=active_edge_attr)
+        out = conv(h, active_edges)
         result = {}
         for nt in NODE_TYPES:
             x_in = h[nt]
@@ -354,9 +521,73 @@ class HeteroRGCN(nn.Module):
                 result[nt] = x_in
         return result
 
-    def forward(self, x_dict, edge_index_dict, edge_attr_dict=None, batch=None):
+    def forward(
+        self,
+        x_dict: dict,
+        edge_index_dict: dict,
+        edge_attr_dict: dict | None = None,  # accepted but ignored — structural ablation
+        batch: dict | None = None,
+    ) -> torch.Tensor:
         h = self._project_inputs(x_dict)
-        h = self._conv_and_norm(h, self.conv1, self.ln1, edge_index_dict, edge_attr_dict)
-        h = self._conv_and_norm(h, self.conv2, self.ln2, edge_index_dict, edge_attr_dict)
+        h = self._conv_and_norm(h, self.conv1, self.ln1, edge_index_dict)
+        h = self._conv_and_norm(h, self.conv2, self.ln2, edge_index_dict)
         commit_emb = h["commit"]
         return self.classifier(commit_emb).squeeze(-1)
+
+
+# ── No-graph MLP baseline ─────────────────────────────────────────────────────
+
+class CommitMLP(nn.Module):
+    """
+    No-graph MLP baseline for commit-level VCC detection.
+
+    Uses only commit node features — no message passing, no neighbourhood
+    aggregation. Answers whether the GNN is genuinely using graph topology
+    or merely acting as a feature propagator.
+
+    Architecture:
+        LazyLinear(hidden) + ReLU + Dropout
+        Linear(hidden, hidden) + ReLU + Dropout
+        Linear(hidden, 1)
+
+    Same interface as HeteroSAGE/HeteroRGCN for drop-in use in train.py.
+    All non-commit inputs (edge_index_dict, edge_attr_dict) are ignored.
+    """
+
+    def __init__(self, hidden: int = 128, dropout: float = 0.3):
+        super().__init__()
+        self.hidden    = hidden
+        self.dropout_p = dropout
+
+        self.proj   = nn.LazyLinear(hidden)
+        self.fc1    = nn.Linear(hidden, hidden)
+        self.ln1    = nn.LayerNorm(hidden)
+        self.fc2    = nn.Linear(hidden, hidden)
+        self.ln2    = nn.LayerNorm(hidden)
+        self.classifier = nn.Linear(hidden, 1)
+
+        self._reset_parameters()
+
+    def _reset_parameters(self):
+        for m in self.modules():
+            if isinstance(m, nn.Linear):
+                if isinstance(m.weight, UninitializedParameter):
+                    continue
+                nn.init.xavier_uniform_(m.weight)
+                if m.bias is not None:
+                    nn.init.zeros_(m.bias)
+
+    def forward(
+        self,
+        x_dict: dict,
+        edge_index_dict: dict,       # ignored
+        edge_attr_dict: dict | None = None,  # ignored
+        batch: dict | None = None,   # ignored
+    ) -> torch.Tensor:
+        commit_x = x_dict["commit"]  # [B, feat_dim]
+        h = F.relu(self.proj(commit_x))
+        h = F.dropout(h, p=self.dropout_p, training=self.training)
+        h = F.relu(self.ln1(self.fc1(h)))
+        h = F.dropout(h, p=self.dropout_p, training=self.training)
+        h = F.relu(self.ln2(self.fc2(h)))
+        return self.classifier(h).squeeze(-1)  # [B]

@@ -1,0 +1,8 @@
+torch>=2.6.0
+torch_geometric>=2.6.0
+numpy>=1.24
+pandas>=1.5
+scikit-learn>=1.2
+tqdm>=4.64
+matplotlib>=3.6
+networkx>=3.0
