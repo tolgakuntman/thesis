@@ -1,0 +1,75 @@
+# Ablation study configurations — Chapter 5 thesis experiments
+#
+# All ablations use the frozen training protocol (configs/default_training.yaml).
+# The base regime includes: --ablate_fn_code_metrics --ablate_file_code_metrics
+# (code size metrics are excluded from all ablation comparisons per protocol).
+#
+# Run all ablations on the matched_normals_v1 benchmark with:
+#   bash experiments/ablations/run_ablation_sweep.sh
+#
+# Or individually:
+#   python scripts/training/train.py --run_name <name> [flags below]
+
+ablations:
+  # 1. Full model (baseline for ablation table)
+  full_model:
+    run_name: abl_full
+    flags: []
+
+  # 2. No code embedding (GraphCodeBERT in function nodes)
+  no_code_emb:
+    run_name: abl_no_code_emb
+    flags: [--ablate_code_emb]
+
+  # 3. No message embedding (commit message BERT)
+  no_msg_emb:
+    run_name: abl_no_msg_emb
+    flags: [--ablate_msg_emb]
+
+  # 4. No SDLC context (issue/PR/release_tag)
+  no_sdlc:
+    run_name: abl_no_sdlc
+    flags: [--ablate_sdlc]
+
+  # 5. No function change-type flags (fct_* one-hot dims)
+  no_fn_categorical:
+    run_name: abl_no_fn_cat
+    flags: [--ablate_fn_categorical]
+
+  # 6. No embeddings (code + message)
+  no_embeddings:
+    run_name: abl_no_embeddings
+    flags: [--ablate_code_emb, --ablate_msg_emb]
+
+  # 7. No developer context (SHAP-justified)
+  no_developer:
+    run_name: abl_no_dev
+    flags: [--ablate_developer]
+
+  # 8. No hunk node type (structural exclusion — best repo-split result)
+  no_hunk:
+    run_name: abl_no_hunk
+    exclude_node_types: [hunk]
+
+  # 9. SHAP-justified minimal ablations (kfold_final protocol)
+  shap_minimal:
+    run_name: abl_shap_minimal
+    flags: [--ablate_hunk_metrics, --ablate_commit_merge]
+
+# Architecture ablation
+architecture:
+  # R-GCN (no edge features) vs HeteroSAGE
+  rgcn_b4:
+    run_name: arch_rgcn_b4
+    model: rgcn
+    num_bases: 4
+    flags: [--exclude_node_types, hunk]
+
+# Generalization splits (run via experiments/generalization/)
+generalization_splits:
+  - repo_split       # primary (cross-project)
+  - temporal_split   # temporal generalization
+  - developer_split  # new-developer generalization
+  - cwe_split        # CWE-type generalization
+  - severity_split   # CVSS-severity generalization
+  - cold_start_split # cold-start (rare repos)

@@ -1,3 +1,8 @@
+# WARNING: This file contains 5 unresolved git merge conflicts (<<<<<<< markers at
+# lines 380, 500, 517, 1257, 1275). It is the LEGACY graph builder — the active
+# pipeline uses scripts/data/build_graphs_final.py instead.
+# Resolve conflicts before importing this module.
+
 from __future__ import annotations
 
 import re
