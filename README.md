@@ -2,9 +2,6 @@
 
 Binary classifier for Vulnerability Contributing Commits (VCCs) at commit time, using a heterogeneous graph neural network over per-commit ego-graphs from the ICVul++ dataset.
 
-**Primary metric:** F1 (best-sweep threshold)  
-**Secondary metrics:** MCC, AUC-PR  
-**Checkpointing criterion:** val AUC-PR (threshold-free, imbalance-robust)  
 **Label:** VCC = 1, Fix Commits (FC) and normal commits = 0
 
 ---
@@ -38,7 +35,7 @@ This repository consumes the tabular CSVs and embeddings produced by ICVulPP and
 
 ## Research Objective
 
-Just-in-time (JIT) vulnerability prediction identifies vulnerability-introducing commits at commit time, before a CVE is filed. Prior work uses flat commit-level features or treats code changes as text. This thesis evaluates whether a heterogeneous graph representation — encoding commit, file, function, hunk, developer, issue, pull request, and release tag as typed nodes — improves F1 over flat-feature baselines, and uses ablations and SHAP attribution to identify which components contribute.
+This work studies commit-level vulnerability prediction using heterogeneous graphs constructed from code, developer, and SDLC metadata. The goal is to evaluate whether relational structure improves generalization over flat commit-level representations, and to identify which graph components contribute via ablation and SHAP attribution.
 
 ---
 
@@ -102,6 +99,16 @@ Linear(128 → 1) → scalar logit (pre-sigmoid)
 
 ---
 
+## Evaluation Protocol
+
+**Primary metric:** F1 (best-sweep threshold)  
+**Secondary metrics:** MCC, AUC-PR  
+**Checkpointing:** val AUC-PR — checkpoint selection uses validation AUC-PR due to class imbalance.
+
+All reported numbers are test-set F1 from the `matched_normals_v1` benchmark unless otherwise noted. Val F1 is tracked for monitoring; final claims are based on test F1 from the frozen split.
+
+---
+
 ## Installation
 
 ### Prerequisites
@@ -109,6 +116,10 @@ Linear(128 → 1) → scalar logit (pre-sigmoid)
 - conda (Miniconda or Anaconda)
 - CUDA 12.x (for GPU training; CPU works but is slow)
 - ~64 GB RAM for full dataset loading
+
+**Tested with:** Python 3.11 · PyTorch 2.3 · torch-geometric 2.5 · CUDA 12.1
+
+> `torch-geometric` is not included in `requirements.txt` and must be installed manually. Match the wheel to your CUDA and PyTorch versions: [PyG installation guide](https://pytorch-geometric.readthedocs.io/en/latest/install/installation.html).
 
 ### Create environment
 
@@ -268,7 +279,7 @@ cd jobs/launchers && bash launch_phase6_finals.sh
 
 ### Scratch-disk optimization
 
-`kfold_final.slurm` copies graphs to `$TMPDIR` (local NVMe) before training to reduce I/O on shared filesystems. Adjust `GRAPHS_DIR`, `SPLIT_INDEX`, and `SCALER` at the top of the script for your cluster layout.
+`kfold_final.slurm` copies graphs to `$TMPDIR` (local NVMe) before training; this avoids slow repeated reads from the shared parallel filesystem during k-fold iteration. Adjust `GRAPHS_DIR`, `SPLIT_INDEX`, and `SCALER` at the top of the script for your cluster layout.
 
 ### Environment setup on HPC
 
@@ -389,7 +400,7 @@ mkdir -p "${HF_HOME}"
 | Family | Location | Notes |
 |--------|----------|-------|
 | `final_graph_ready` | `outputs/final_graph_ready/` | Stratified normal sample (31,513 normals). Not used for main thesis results. |
-| `matched_normals_v1` | `outputs/final_graph_ready_matched_normals_v1/` | Complexity-matched normals (cap ×20). **Primary thesis benchmark.** |
+| `matched_normals_v1` | `outputs/final_graph_ready_matched_normals_v1/` | Complexity-matched normals (cap ×20). **Main benchmark used in reported experiments.** |
 
 Do not compare numbers across benchmark families without explicit labeling.
 
@@ -421,4 +432,3 @@ Do not compare numbers across benchmark families without explicit labeling.
 - `*.npy`, `*.pkl`, `*.pt`
 
 ---
-
