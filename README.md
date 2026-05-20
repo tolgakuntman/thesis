@@ -422,8 +422,3 @@ Do not compare numbers across benchmark families without explicit labeling.
 
 ---
 
-## License
-
-MIT License. See `LICENSE` for details.
-
-The ICVul++ dataset is subject to separate license terms. See the ICVulPP repository before redistribution or commercial use.
